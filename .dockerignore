@@ -1,0 +1,9 @@
+.git
+.venv
+.pytest_cache
+__pycache__
+backups
+logs
+*.pyc
+data/*.db
+models/*.gguf

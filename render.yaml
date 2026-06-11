@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: lisa-agent
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: LISA_REQUIRE_LOCAL_MODEL
+        value: "false"
+      - key: LISA_REQUIRE_DOCKER
+        value: "false"
+      - key: LISA_MESSAGE_HUB_ENABLED
+        value: "true"

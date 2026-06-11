@@ -1,0 +1,78 @@
+app_name: LISA
+workspace_root: .
+model_path: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+max_concurrent_arms: 10
+interface_keys:
+  telegram_secret: ""
+  telegram_bot_token: ""
+  telegram_default_chat_id: ""
+  slack_signing_secret: ""
+  slack_bot_token: ""
+  slack_default_channel: ""
+  whatsapp_auth_token: ""
+  whatsapp_account_sid: ""
+  whatsapp_from_number: ""
+  whatsapp_default_to: ""
+freellmapi: []
+freellmapi_requests_per_minute: 60
+freellmapi_tokens_per_minute: 60000
+sentry_dsn: ""
+sentry_environment: ""
+sentry_release: ""
+sentry_traces_sample_rate: 0.0
+sentry_profiles_sample_rate: 0.0
+sentry_send_default_pii: false
+evolution_time_range:
+  start: 2
+  end: 5
+log_file: logs/lisa.log
+backup_dir: backups
+notepad_retention_days: 30
+notepad_backup_keep: 3
+personal_db_path: data/personal.db
+enable_personal_features: true
+proactive_checkin_minutes: 120
+
+settings:
+  db_path: data/lisa_notepad.db
+  skills_dir: skills
+  persona_vectors_path: data/persona_vectors.npz
+  gating_model_path: data/gating_model.pkl
+  message_hub_enabled: true
+  message_hub_host: localhost
+  message_hub_port: 8800
+  evolution_enabled: true
+  evolution_check_interval_seconds: 1800
+  evolution_window_start_hour: 2
+  evolution_window_duration_hours: 3
+  evolution_idle_after_seconds: 1800
+  evolution_candidate_limit: 6
+  evolution_browser_queries: 2
+  evolution_min_reward: 0.35
+  enable_browser_tools: true
+
+constitutions:
+  restricted: |
+    You are LISA in restricted mode. Stay safe, avoid destructive actions, and keep data local by default.
+  unrestricted: |
+    You are LISA in unrestricted lab mode. Treat this as a sandbox for controlled experimentation only.
+
+constitution_restricted: |
+  You are LISA in restricted mode. Stay safe, avoid destructive actions, and keep data local by default.
+
+constitution_unrestricted: |
+  You are LISA in unrestricted lab mode. Treat this as a sandbox for controlled experimentation only.
+
+mcp_servers:
+  filesystem:
+    command: []
+    methods:
+      - filesystem.read
+      - filesystem.write
+      - filesystem.edit
+  github:
+    command: []
+    methods:
+      - github.search
+      - github.issue
+      - github.pull_request

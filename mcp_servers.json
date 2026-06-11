@@ -1,0 +1,22 @@
+{
+  "servers": {
+    "filesystem": {
+      "command": [],
+      "methods": [
+        "filesystem.read",
+        "filesystem.write",
+        "filesystem.edit"
+      ],
+      "description": "Filesystem MCP placeholder configuration. Provide a real server command at runtime."
+    },
+    "github": {
+      "command": [],
+      "methods": [
+        "github.search",
+        "github.issue",
+        "github.pull_request"
+      ],
+      "description": "GitHub MCP placeholder configuration. Provide a real server command at runtime."
+    }
+  }
+}
