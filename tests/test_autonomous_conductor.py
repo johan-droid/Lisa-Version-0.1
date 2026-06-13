@@ -35,14 +35,14 @@ def test_self_directed_conductor_generates_and_submits_goal() -> None:
     llm_client_mock.generate_brain.return_value = fake_generation
     
     conductor_mock.tool_executor = MagicMock()
-    conductor_mock.tool_executor.llm_client = llm_client_mock
+    conductor_mock.runtime = MagicMock()
+    conductor_mock.runtime.llm_client = llm_client_mock
     
     notepad_mock = MagicMock()
     notepad_mock.latest_entries.return_value = []
     conductor_mock.notepad = notepad_mock
     
     writer_mock = AsyncMock()
-    conductor_mock.runtime = MagicMock()
     conductor_mock.runtime.notepad_writer = writer_mock
     
     # 2. Instantiate and run one-off generation

@@ -24,7 +24,7 @@ class FunctionCallParser:
     form, fenced JSON, plain JSON arrays, or simple key-value fallbacks.
     """
 
-    TOOL_PATTERN = re.compile(r"<tool>(.*?)</tool>", re.IGNORECASE | re.DOTALL)
+    TOOL_PATTERN = re.compile(r"<tool(?:_call)?>(.*?)</tool(?:_call)?>", re.IGNORECASE | re.DOTALL)
     FENCED_JSON_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 
     def parse(self, text: str) -> ParsedOutput:

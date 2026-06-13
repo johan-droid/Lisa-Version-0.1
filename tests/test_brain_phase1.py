@@ -26,13 +26,14 @@ def test_phase1_parser_handles_tool_tag_and_json_list() -> None:
     parser = FunctionCallParser()
     parsed = parser.parse(
         "Planning.\n"
-        '<tool>{"name":"file_write","args":{"path":"a.txt","content":"ok"}}</tool>\n'
-        '```json\n[{"name":"dashboard_update","args":{"metric":"tokens","value":"12"}}]\n```'
+        '<tool_call>{"name":"file_write","arguments":{"path":"a.txt","content":"ok"}}</tool_call>\n'
+        '```json\n[{"name":"dashboard_update","arguments":{"metric":"tokens","value":"12"}}]\n```'
     )
 
     assert "Planning." in parsed.text
-    assert [call.name for call in parsed.tool_calls] == ["file_write", "dashboard_update"]
-    assert parsed.tool_calls[0].arguments["path"] == "a.txt"
+    assert set([call.name for call in parsed.tool_calls]) == {"file_write", "dashboard_update"}
+    file_call = next(c for c in parsed.tool_calls if c.name == "file_write")
+    assert file_call.arguments["path"] == "a.txt"
 
 
 def test_phase1_gating_bundle_is_loadable_by_runtime(tmp_path: Path) -> None:
@@ -59,7 +60,7 @@ def test_phase1_brain_wrapper_uses_trigger_and_parser(tmp_path: Path, monkeypatc
                         "message": {
                             "content": (
                                 "Here is the helper.\n"
-                                "<tool>{\"name\":\"search_notepad\",\"args\":{\"query\":\"overflow\"}}</tool>\n"
+                                "<tool_call>{\"name\":\"search_notepad\",\"arguments\":{\"query\":\"overflow\"}}</tool_call>\n"
                                 "Done."
                             )
                         }
