@@ -65,7 +65,7 @@ Generate 3 candidate tasks I could perform autonomously. For each, provide:
 Format as a JSON array of objects.
 """
         try:
-            llm_client = self.conductor.tool_executor.llm_client
+            llm_client = getattr(self.conductor.runtime, 'llm_client', getattr(getattr(self.conductor, 'tool_executor', None), 'llm_client', None))
             # We call chat/complete on llm_client
             chat_resp = await llm_client.generate_brain(
                 system_prompt="You are a self-directed, autonomous software developer agent.",

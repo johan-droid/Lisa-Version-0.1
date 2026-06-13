@@ -6,8 +6,7 @@
         "filesystem.read",
         "filesystem.write",
         "filesystem.edit"
-      ],
-      "description": "Filesystem MCP placeholder configuration. Provide a real server command at runtime."
+      ]
     },
     "github": {
       "command": [],
@@ -15,8 +14,7 @@
         "github.search",
         "github.issue",
         "github.pull_request"
-      ],
-      "description": "GitHub MCP placeholder configuration. Provide a real server command at runtime."
+      ]
     }
   }
 }
