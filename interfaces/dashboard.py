@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import json
 
-def render_dashboard_html(ws_path: str = "/ws", legacy_ws_path: str = "/ws/dashboard") -> str:
+
+def render_dashboard_html(
+    ws_path: str = "/ws", legacy_ws_path: str = "/ws/dashboard"
+) -> str:
+    ws_path_literal = json.dumps(str(ws_path)).replace("</", "<\\/")
+    legacy_ws_path_literal = json.dumps(str(legacy_ws_path)).replace("</", "<\\/")
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -191,8 +197,8 @@ def render_dashboard_html(ws_path: str = "/ws", legacy_ws_path: str = "/ws/dashb
 
     function connect() {{
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      const socketPath = "{ws_path}";
-      const legacySocketPath = "{legacy_ws_path}";
+      const socketPath = {ws_path_literal};
+      const legacySocketPath = {legacy_ws_path_literal};
       const socket = new WebSocket(`${{proto}}://${{location.host}}${{socketPath}}`);
       // Legacy endpoint kept for compatibility with older deployments: ${{legacySocketPath}}
       socket.addEventListener("open", () => {{

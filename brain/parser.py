@@ -24,8 +24,12 @@ class FunctionCallParser:
     form, fenced JSON, plain JSON arrays, or simple key-value fallbacks.
     """
 
-    TOOL_PATTERN = re.compile(r"<tool(?:_call)?>(.*?)</tool(?:_call)?>", re.IGNORECASE | re.DOTALL)
-    FENCED_JSON_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+    TOOL_PATTERN = re.compile(
+        r"<tool(?:_call)?>(.*?)</tool(?:_call)?>", re.IGNORECASE | re.DOTALL
+    )
+    FENCED_JSON_PATTERN = re.compile(
+        r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL
+    )
 
     def parse(self, text: str) -> ParsedOutput:
         raw_text = text
@@ -126,7 +130,9 @@ class FunctionCallParser:
             key, value = line.split(separator, 1)
             fields[key.strip().lower()] = value.strip()
 
-        name = str(fields.get("name") or fields.get("tool") or fields.get("function") or "").strip()
+        name = str(
+            fields.get("name") or fields.get("tool") or fields.get("function") or ""
+        ).strip()
         if not name:
             return []
 
@@ -200,7 +206,11 @@ class FunctionCallParser:
 
         if not name:
             return []
-        return [ToolCall(name=name, arguments=arguments, raw=json.dumps(data, ensure_ascii=False))]
+        return [
+            ToolCall(
+                name=name, arguments=arguments, raw=json.dumps(data, ensure_ascii=False)
+            )
+        ]
 
     def _scan_for_json_objects(self, text: str) -> list[tuple[str, tuple[int, int]]]:
         decoder = json.JSONDecoder()
@@ -246,7 +256,10 @@ class FunctionCallParser:
         unique: list[ToolCall] = []
         seen: set[tuple[str, str]] = set()
         for call in tool_calls:
-            signature = (call.name, json.dumps(call.arguments, sort_keys=True, default=str))
+            signature = (
+                call.name,
+                json.dumps(call.arguments, sort_keys=True, default=str),
+            )
             if signature in seen:
                 continue
             seen.add(signature)

@@ -13,7 +13,6 @@ import numpy as np
 
 from lisa.personas import Persona
 
-
 TOKEN_PATTERN = re.compile(r"[a-z0-9_]+")
 
 
@@ -68,7 +67,9 @@ class PersonaSklearnGatingBundle:
         return cls(
             vectorizer=state["vectorizer"],
             classifier=state["classifier"],
-            personas=tuple(state.get("personas") or tuple(persona.value for persona in Persona)),
+            personas=tuple(
+                state.get("personas") or tuple(persona.value for persona in Persona)
+            ),
             trained_at=state.get("trained_at"),
         )
 
@@ -86,7 +87,9 @@ class PersonaSklearnGatingBundle:
     def predict_blend(self, text: str) -> dict[str, float]:
         probabilities = self.predict_proba(text)
         total = sum(probabilities.values()) or 1.0
-        normalized = {name: round(value / total, 3) for name, value in probabilities.items()}
+        normalized = {
+            name: round(value / total, 3) for name, value in probabilities.items()
+        }
         remainder = round(1.0 - sum(normalized.values()), 3)
         first_key = self.personas[0]
         normalized[first_key] = round(normalized[first_key] + remainder, 3)
@@ -224,7 +227,9 @@ class PersonaGatingNetwork:
             raise ValueError("At least one training example is required.")
 
         rng = np.random.default_rng(seed)
-        encoder = TfIdfEncoder(max_features=max_features).fit(example.text for example in examples)
+        encoder = TfIdfEncoder(max_features=max_features).fit(
+            example.text for example in examples
+        )
         feature_count = max(len(encoder.vocabulary), 1)
         personas = tuple(persona.value for persona in Persona)
         W1 = rng.normal(0.0, 0.05, size=(feature_count, hidden_size)).astype(np.float32)
@@ -326,10 +331,16 @@ class PersonaGatingNetwork:
         feature_count = max(len(self.encoder.vocabulary), 1)
         if self.W1.shape[0] != feature_count:
             rng = np.random.default_rng(42)
-            self.W1 = rng.normal(0.0, 0.05, size=(feature_count, self.hidden_size)).astype(np.float32)
+            self.W1 = rng.normal(
+                0.0, 0.05, size=(feature_count, self.hidden_size)
+            ).astype(np.float32)
 
-        target_matrix = np.vstack([self._example_target(example) for example in examples])
-        feature_matrix = np.vstack([self.encoder.transform(example.text) for example in examples])
+        target_matrix = np.vstack(
+            [self._example_target(example) for example in examples]
+        )
+        feature_matrix = np.vstack(
+            [self.encoder.transform(example.text) for example in examples]
+        )
         if feature_matrix.shape[1] == 0:
             feature_matrix = np.zeros((len(examples), feature_count), dtype=np.float32)
 
@@ -366,7 +377,9 @@ class PersonaGatingNetwork:
     def predict_blend(self, text: str) -> dict[str, float]:
         probabilities = self.predict_proba(text)
         total = sum(probabilities.values()) or 1.0
-        normalized = {name: round(value / total, 3) for name, value in probabilities.items()}
+        normalized = {
+            name: round(value / total, 3) for name, value in probabilities.items()
+        }
         remainder = round(1.0 - sum(normalized.values()), 3)
         first_key = self.personas[0]
         normalized[first_key] = round(normalized[first_key] + remainder, 3)
@@ -385,7 +398,10 @@ class PersonaGatingNetwork:
 
     def _example_target(self, example: "PersonaTrainingExample") -> np.ndarray:
         if isinstance(example.target, dict):
-            target = np.array([float(example.target.get(persona, 0.0)) for persona in self.personas], dtype=np.float32)
+            target = np.array(
+                [float(example.target.get(persona, 0.0)) for persona in self.personas],
+                dtype=np.float32,
+            )
             total = float(target.sum()) or 1.0
             return target / total
 
@@ -461,8 +477,12 @@ def generate_synthetic_persona_training_examples(
     for index in range(mixed_target_count):
         primary = personas[index % len(personas)]
         secondary = personas[(index + 1) % len(personas)]
-        primary_template = persona_templates[primary][index % len(persona_templates[primary])]
-        secondary_template = persona_templates[secondary][(index + 2) % len(persona_templates[secondary])]
+        primary_template = persona_templates[primary][
+            index % len(persona_templates[primary])
+        ]
+        secondary_template = persona_templates[secondary][
+            (index + 2) % len(persona_templates[secondary])
+        ]
         weight = 0.6 if index % 2 == 0 else 0.7
         text = f"{primary_template} and also {secondary_template}"
         examples.append(
@@ -534,6 +554,7 @@ def train_persona_gating_network(
         learning_rate=learning_rate,
     )
 
+
 def seed_persona_training_examples() -> list[PersonaTrainingExample]:
     examples: list[PersonaTrainingExample] = []
     templates = {
@@ -576,11 +597,17 @@ def seed_persona_training_examples() -> list[PersonaTrainingExample]:
             ),
             PersonaTrainingExample(
                 text="monitor the deployment, recover errors, and improve the workflow",
-                target={Persona.GUARDIAN.value: 0.45, Persona.EVOLUTION_ENGINE.value: 0.55},
+                target={
+                    Persona.GUARDIAN.value: 0.45,
+                    Persona.EVOLUTION_ENGINE.value: 0.55,
+                },
             ),
             PersonaTrainingExample(
                 text="coordinate the handoff while designing the plan",
-                target={Persona.DISTRIBUTED_MIND.value: 0.55, Persona.ARCHITECT.value: 0.45},
+                target={
+                    Persona.DISTRIBUTED_MIND.value: 0.55,
+                    Persona.ARCHITECT.value: 0.45,
+                },
             ),
         ]
     )

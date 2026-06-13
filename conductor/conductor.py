@@ -25,7 +25,9 @@ class BrainTask:
 @dataclass(slots=True)
 class ToolTask:
     id: str = field(default_factory=lambda: str(uuid4()))
-    tool_call: ToolCall = field(default_factory=lambda: ToolCall(name="placeholder", arguments={}))
+    tool_call: ToolCall = field(
+        default_factory=lambda: ToolCall(name="placeholder", arguments={})
+    )
     constitution: str = "restricted"
     priority: int = 0
     callback_future: asyncio.Future[Any] | None = None

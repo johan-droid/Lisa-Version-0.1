@@ -22,7 +22,6 @@ from bs4 import BeautifulSoup
 from cachetools import LRUCache
 from cryptography.fernet import Fernet, InvalidToken
 
-
 ToolCallable = Callable[..., Awaitable[Any]]
 
 
@@ -125,12 +124,16 @@ class EncryptedKeyVault:
         try:
             decrypted = self.fernet.decrypt(encrypted)
         except InvalidToken as exc:
-            raise RuntimeError("Unable to decrypt keys.enc with the supplied master key.") from exc
+            raise RuntimeError(
+                "Unable to decrypt keys.enc with the supplied master key."
+            ) from exc
         self._payload = json.loads(decrypted.decode("utf-8"))
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        plaintext = json.dumps(self._payload, indent=2, ensure_ascii=False).encode("utf-8")
+        plaintext = json.dumps(self._payload, indent=2, ensure_ascii=False).encode(
+            "utf-8"
+        )
         self.path.write_bytes(self.fernet.encrypt(plaintext))
 
     def set_provider(self, name: str, config: ProviderConfig) -> None:
@@ -203,15 +206,21 @@ class ToolExecutor:
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.skills_dir = (skills_dir or self.workspace_root / "skills").resolve()
-        self.skills_manifest_path = (skills_manifest_path or self.workspace_root / "skills_manifest.json").resolve()
-        self.mcp_config_path = (mcp_config_path or self.workspace_root / "mcp_servers.json").resolve()
+        self.skills_manifest_path = (
+            skills_manifest_path or self.workspace_root / "skills_manifest.json"
+        ).resolve()
+        self.mcp_config_path = (
+            mcp_config_path or self.workspace_root / "mcp_servers.json"
+        ).resolve()
         self.keys_path = (keys_path or self.workspace_root / "keys.enc").resolve()
         self.timeout_seconds = timeout_seconds
         self.docker_image = docker_image
         self.user_agent = user_agent
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._tools: dict[str, ToolCallable] = {}
-        self._browser_cache: LRUCache[str, dict[str, Any]] = LRUCache(maxsize=browser_cache_size)
+        self._browser_cache: LRUCache[str, dict[str, Any]] = LRUCache(
+            maxsize=browser_cache_size
+        )
         self._domain_last_fetch: dict[str, float] = {}
         self._domain_locks: dict[str, asyncio.Lock] = {}
         self._robots_cache: dict[str, urllib.robotparser.RobotFileParser] = {}
@@ -236,15 +245,21 @@ class ToolExecutor:
             self.vault.set_provider(name, config)
 
     def list_mcp_servers(self) -> dict[str, list[str]]:
-        return {name: config.methods for name, config in self._load_mcp_configs().items()}
+        return {
+            name: config.methods for name, config in self._load_mcp_configs().items()
+        }
 
     def _load_or_initialize_files(self, master_key: str | bytes | None) -> None:
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         if not self.skills_manifest_path.exists():
-            self.skills_manifest_path.write_text(json.dumps(self._skills_manifest, indent=2), encoding="utf-8")
+            self.skills_manifest_path.write_text(
+                json.dumps(self._skills_manifest, indent=2), encoding="utf-8"
+            )
         else:
             try:
-                self._skills_manifest = json.loads(self.skills_manifest_path.read_text(encoding="utf-8"))
+                self._skills_manifest = json.loads(
+                    self.skills_manifest_path.read_text(encoding="utf-8")
+                )
             except json.JSONDecodeError:
                 self._skills_manifest = {"skills": {}}
         if not self.mcp_config_path.exists():
@@ -254,12 +269,20 @@ class ToolExecutor:
                         "servers": {
                             "filesystem": {
                                 "command": [],
-                                "methods": ["filesystem.read", "filesystem.write", "filesystem.edit"],
+                                "methods": [
+                                    "filesystem.read",
+                                    "filesystem.write",
+                                    "filesystem.edit",
+                                ],
                                 "description": "Filesystem MCP placeholder configuration.",
                             },
                             "github": {
                                 "command": [],
-                                "methods": ["github.search", "github.issue", "github.pull_request"],
+                                "methods": [
+                                    "github.search",
+                                    "github.issue",
+                                    "github.pull_request",
+                                ],
                                 "description": "GitHub MCP placeholder configuration.",
                             },
                         }
@@ -299,13 +322,20 @@ class ToolExecutor:
             return ToolResult(success=False, error=f"Unknown tool: {name}", tool=name)
         async with self._semaphore:
             try:
-                result = await asyncio.wait_for(tool(**kwargs), timeout=self.timeout_seconds)
+                result = await asyncio.wait_for(
+                    tool(**kwargs), timeout=self.timeout_seconds
+                )
                 return self._coerce_result(name, result)
             except Exception as exc:
                 return ToolResult(success=False, error=str(exc), tool=name)
 
-    async def execute_many(self, calls: list[tuple[str, dict[str, Any]]]) -> list[ToolResult]:
-        tasks = [asyncio.create_task(self.invoke(name, **arguments)) for name, arguments in calls]
+    async def execute_many(
+        self, calls: list[tuple[str, dict[str, Any]]]
+    ) -> list[ToolResult]:
+        tasks = [
+            asyncio.create_task(self.invoke(name, **arguments))
+            for name, arguments in calls
+        ]
         return list(await asyncio.gather(*tasks))
 
     async def browser_fetch(self, url: str, extract_text: bool = True) -> ToolResult:
@@ -314,14 +344,20 @@ class ToolExecutor:
             await self._respect_robots(parsed)
             await self._throttle_domain(parsed.netloc)
             if url in self._browser_cache:
-                return ToolResult(success=True, data=self._browser_cache[url], tool="browser_fetch")
+                return ToolResult(
+                    success=True, data=self._browser_cache[url], tool="browser_fetch"
+                )
 
             headers = {"User-Agent": self.user_agent}
-            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True, headers=headers) as client:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_seconds, follow_redirects=True, headers=headers
+            ) as client:
                 response = await client.get(url)
                 response.raise_for_status()
 
-            data = self._parse_html_page(str(response.url), response.text, extract_text=extract_text)
+            data = self._parse_html_page(
+                str(response.url), response.text, extract_text=extract_text
+            )
             self._browser_cache[url] = data
             return ToolResult(success=True, data=data, tool="browser_fetch")
         except Exception as exc:
@@ -331,13 +367,21 @@ class ToolExecutor:
         try:
             if not query.strip():
                 raise ValueError("query must not be empty")
-            url = f"https://lite.duckduckgo.com/lite/?q={urllib.parse.quote_plus(query)}"
+            url = (
+                f"https://lite.duckduckgo.com/lite/?q={urllib.parse.quote_plus(query)}"
+            )
             headers = {"User-Agent": self.user_agent}
-            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True, headers=headers) as client:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_seconds, follow_redirects=True, headers=headers
+            ) as client:
                 response = await client.get(url)
                 response.raise_for_status()
             results = self._parse_duckduckgo_lite(response.text)
-            return ToolResult(success=True, data={"query": query, "results": results}, tool="browser_search")
+            return ToolResult(
+                success=True,
+                data={"query": query, "results": results},
+                tool="browser_search",
+            )
         except Exception as exc:
             return ToolResult(success=False, error=str(exc), tool="browser_search")
 
@@ -356,7 +400,9 @@ class ToolExecutor:
         timeout: int | None = None,
     ) -> ToolResult:
         try:
-            data = await self._mcp_call(server, method, params or {}, timeout or self.timeout_seconds)
+            data = await self._mcp_call(
+                server, method, params or {}, timeout or self.timeout_seconds
+            )
             return ToolResult(success=True, data=data, tool="mcp_call")
         except Exception as exc:
             return ToolResult(success=False, error=str(exc), tool="mcp_call")
@@ -366,7 +412,11 @@ class ToolExecutor:
             resolved = self._resolve_workspace_path(path)
             async with aiofiles.open(resolved, "r", encoding="utf-8") as handle:
                 content = await handle.read()
-            return ToolResult(success=True, data={"path": str(resolved), "content": content}, tool="file_read")
+            return ToolResult(
+                success=True,
+                data={"path": str(resolved), "content": content},
+                tool="file_read",
+            )
         except Exception as exc:
             return ToolResult(success=False, error=str(exc), tool="file_read")
 
@@ -378,7 +428,10 @@ class ToolExecutor:
                 await handle.write(content)
             return ToolResult(
                 success=True,
-                data={"path": str(resolved), "bytes_written": len(content.encode("utf-8"))},
+                data={
+                    "path": str(resolved),
+                    "bytes_written": len(content.encode("utf-8")),
+                },
                 tool="file_write",
             )
         except Exception as exc:
@@ -413,12 +466,21 @@ class ToolExecutor:
         temperature: float = 0.2,
     ) -> ToolResult:
         try:
-            config = self.provider_configs.get(provider) or (self.vault.get_provider(provider) if self.vault else None)
+            config = self.provider_configs.get(provider) or (
+                self.vault.get_provider(provider) if self.vault else None
+            )
             if config is None:
                 raise KeyError(f"No provider config is available for '{provider}'.")
-            response = await self._call_provider(config, prompt, max_tokens=max_tokens, temperature=temperature)
-            total_tokens = int(response.get("usage", {}).get("total_tokens") or self._estimate_tokens(prompt, response["content"]))
-            await self.dashboard_update(metric=f"llm_tokens_{provider}", value=str(total_tokens))
+            response = await self._call_provider(
+                config, prompt, max_tokens=max_tokens, temperature=temperature
+            )
+            total_tokens = int(
+                response.get("usage", {}).get("total_tokens")
+                or self._estimate_tokens(prompt, response["content"])
+            )
+            await self.dashboard_update(
+                metric=f"llm_tokens_{provider}", value=str(total_tokens)
+            )
             return ToolResult(
                 success=True,
                 data={
@@ -443,24 +505,40 @@ class ToolExecutor:
                 await handle.write(code)
             module = self._import_skill_module(slug, path)
             skill_callable = getattr(module, "skill", None)
-            if skill_callable is None or not inspect.iscoroutinefunction(skill_callable):
-                raise ValueError("skill modules must define async def skill(**kwargs) -> ToolResult")
+            if skill_callable is None or not inspect.iscoroutinefunction(
+                skill_callable
+            ):
+                raise ValueError(
+                    "skill modules must define async def skill(**kwargs) -> ToolResult"
+                )
             self.register_tool(slug, self._build_skill_wrapper(slug, skill_callable))
             self._skills_manifest.setdefault("skills", {})[slug] = {
                 "name": name,
                 "path": str(path),
                 "function": "skill",
             }
-            async with aiofiles.open(self.skills_manifest_path, "w", encoding="utf-8") as handle:
-                await handle.write(json.dumps(self._skills_manifest, indent=2, ensure_ascii=False))
-            return ToolResult(success=True, data={"path": str(path), "status": "registered"}, tool="add_skill")
+            async with aiofiles.open(
+                self.skills_manifest_path, "w", encoding="utf-8"
+            ) as handle:
+                await handle.write(
+                    json.dumps(self._skills_manifest, indent=2, ensure_ascii=False)
+                )
+            return ToolResult(
+                success=True,
+                data={"path": str(path), "status": "registered"},
+                tool="add_skill",
+            )
         except Exception as exc:
             return ToolResult(success=False, error=str(exc), tool="add_skill")
 
     async def dashboard_update(self, metric: str, value: Any) -> ToolResult:
         try:
             await self.dashboard_bus.publish(metric, value)
-            return ToolResult(success=True, data={"metric": metric, "value": value}, tool="dashboard_update")
+            return ToolResult(
+                success=True,
+                data={"metric": metric, "value": value},
+                tool="dashboard_update",
+            )
         except Exception as exc:
             return ToolResult(success=False, error=str(exc), tool="dashboard_update")
 
@@ -483,8 +561,12 @@ class ToolExecutor:
             robots_url = f"{parsed_url.scheme}://{domain}/robots.txt"
             parser.set_url(robots_url)
             try:
-                async with httpx.AsyncClient(timeout=min(5, self.timeout_seconds), follow_redirects=True) as client:
-                    response = await client.get(robots_url, headers={"User-Agent": self.user_agent})
+                async with httpx.AsyncClient(
+                    timeout=min(5, self.timeout_seconds), follow_redirects=True
+                ) as client:
+                    response = await client.get(
+                        robots_url, headers={"User-Agent": self.user_agent}
+                    )
                 if response.status_code < 400:
                     parser.parse(response.text.splitlines())
                 else:
@@ -496,7 +578,9 @@ class ToolExecutor:
             self._robots_cache[domain] = parser
 
         if not parser.can_fetch(self.user_agent, parsed_url.geturl()):
-            raise PermissionError(f"Robots.txt disallows fetching {parsed_url.geturl()}")
+            raise PermissionError(
+                f"Robots.txt disallows fetching {parsed_url.geturl()}"
+            )
 
     async def _throttle_domain(self, domain: str, minimum_delay: float = 0.35) -> None:
         lock = self._domain_locks.setdefault(domain, asyncio.Lock())
@@ -525,16 +609,22 @@ class ToolExecutor:
                 mem_limit="100m",
                 read_only=True,
                 working_dir="/workspace",
-                volumes={str(self.workspace_root): {"bind": "/workspace", "mode": "rw"}},
+                volumes={
+                    str(self.workspace_root): {"bind": "/workspace", "mode": "rw"}
+                },
                 environment={"HOME": "/tmp"},
                 security_opt=["no-new-privileges"],
                 cap_drop=["ALL"],
                 pids_limit=128,
             )
             wait_result = container.wait(timeout=timeout)
-            logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
+            logs = container.logs(stdout=True, stderr=True).decode(
+                "utf-8", errors="replace"
+            )
             stdout = self._sanitize_output(logs)
-            exit_code = int(wait_result.get("StatusCode", 1) if isinstance(wait_result, dict) else 0)
+            exit_code = int(
+                wait_result.get("StatusCode", 1) if isinstance(wait_result, dict) else 0
+            )
             return {"returncode": exit_code, "stdout": stdout, "stderr": ""}
         except Exception:
             if container is not None:
@@ -557,21 +647,32 @@ class ToolExecutor:
         if config is None:
             raise KeyError(f"Unknown MCP server: {server}")
         if not config.command:
-            raise RuntimeError(f"MCP server '{server}' is configured but has no command.")
+            raise RuntimeError(
+                f"MCP server '{server}' is configured but has no command."
+            )
 
         process = await self._ensure_mcp_process(config)
         async with process.lock:
             request_id = process.next_request_id()
-            request = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+            request = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            }
             if process.process.stdin is None or process.process.stdout is None:
                 raise RuntimeError("MCP stdio pipes are unavailable.")
             process.process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
             await asyncio.wait_for(process.process.stdin.drain(), timeout=timeout)
 
             while True:
-                raw = await asyncio.wait_for(process.process.stdout.readline(), timeout=timeout)
+                raw = await asyncio.wait_for(
+                    process.process.stdout.readline(), timeout=timeout
+                )
                 if not raw:
-                    raise RuntimeError(f"MCP server '{server}' closed the pipe unexpectedly.")
+                    raise RuntimeError(
+                        f"MCP server '{server}' closed the pipe unexpectedly."
+                    )
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
@@ -641,7 +742,11 @@ class ToolExecutor:
                 response = await client.post(url, json=payload, headers=headers)
                 response.raise_for_status()
             data = response.json()
-            content = "".join(part.get("text", "") for part in data.get("content", []) if isinstance(part, dict))
+            content = "".join(
+                part.get("text", "")
+                for part in data.get("content", [])
+                if isinstance(part, dict)
+            )
             usage = data.get("usage") or {}
             return {"content": content, "usage": usage}
 
@@ -652,7 +757,10 @@ class ToolExecutor:
             )
             payload = {
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature},
+                "generationConfig": {
+                    "maxOutputTokens": max_tokens,
+                    "temperature": temperature,
+                },
             }
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 response = await client.post(url, json=payload, headers=headers)
@@ -663,7 +771,9 @@ class ToolExecutor:
             if candidates:
                 content = candidates[0].get("content", {})
                 parts = content.get("parts", []) if isinstance(content, dict) else []
-                text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+                text = "".join(
+                    part.get("text", "") for part in parts if isinstance(part, dict)
+                )
             usage = data.get("usageMetadata") or {}
             return {"content": text, "usage": usage}
 
@@ -691,10 +801,14 @@ class ToolExecutor:
         return max(1, len(prompt.split()) + len(response.split()))
 
     @staticmethod
-    def _parse_html_page(url: str, html: str, *, extract_text: bool = True) -> dict[str, Any]:
+    def _parse_html_page(
+        url: str, html: str, *, extract_text: bool = True
+    ) -> dict[str, Any]:
         soup = BeautifulSoup(html, "html.parser")
         title = soup.title.get_text(" ", strip=True) if soup.title else ""
-        code_blocks = [block.get_text("\n", strip=True) for block in soup.find_all(["pre", "code"])]
+        code_blocks = [
+            block.get_text("\n", strip=True) for block in soup.find_all(["pre", "code"])
+        ]
         links = []
         for anchor in soup.find_all("a", href=True):
             text = anchor.get_text(" ", strip=True)
@@ -730,7 +844,9 @@ class ToolExecutor:
             container = anchor.find_parent(["tr", "td", "div"]) or anchor.parent
             snippet = ""
             if container is not None:
-                snippet = re.sub(r"\s+", " ", container.get_text(" ", strip=True)).strip()
+                snippet = re.sub(
+                    r"\s+", " ", container.get_text(" ", strip=True)
+                ).strip()
                 snippet = snippet.replace(title, "", 1).strip()
             results.append({"title": title, "url": href, "snippet": snippet})
             seen.add(href)
@@ -740,7 +856,9 @@ class ToolExecutor:
         return results
 
     @staticmethod
-    def _coerce_result(tool: str, result: ToolResult | dict[str, Any] | Any) -> ToolResult:
+    def _coerce_result(
+        tool: str, result: ToolResult | dict[str, Any] | Any
+    ) -> ToolResult:
         if isinstance(result, ToolResult):
             if result.tool is None:
                 result.tool = tool
@@ -792,11 +910,17 @@ class ToolExecutor:
             except Exception:
                 continue
             skill_callable = getattr(module, "skill", None)
-            if skill_callable is None or not inspect.iscoroutinefunction(skill_callable):
+            if skill_callable is None or not inspect.iscoroutinefunction(
+                skill_callable
+            ):
                 continue
-            self.register_tool(str(slug), self._build_skill_wrapper(str(slug), skill_callable))
+            self.register_tool(
+                str(slug), self._build_skill_wrapper(str(slug), skill_callable)
+            )
 
-    def _build_skill_wrapper(self, slug: str, skill_callable: Callable[..., Awaitable[Any]]) -> ToolCallable:
+    def _build_skill_wrapper(
+        self, slug: str, skill_callable: Callable[..., Awaitable[Any]]
+    ) -> ToolCallable:
         async def _wrapped(**kwargs: Any) -> ToolResult:
             result = await skill_callable(**kwargs)
             return self._coerce_result(slug, result)

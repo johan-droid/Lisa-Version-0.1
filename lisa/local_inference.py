@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -11,7 +12,6 @@ from typing import Any, Protocol
 import numpy as np
 
 from lisa.gating import PersonaGatingNetwork
-from lisa.personas import Persona
 from lisa.personas import infer_persona_blend
 from lisa.soft_prompts import PersonaSoftPromptBank
 from lisa.schemas import ToolCall
@@ -35,18 +35,24 @@ class BrainGeneration:
 
 
 class LocalInferenceBackend(Protocol):
-    async def generate(self, request: LocalGenerationRequest) -> BrainGeneration:
-        ...
+    async def generate(self, request: LocalGenerationRequest) -> BrainGeneration: ...
 
 
 class ToolCallParser:
     """Extract function-call style payloads from generated text."""
 
-    TOOL_CALL_PATTERN = re.compile(r"<tool_call>(.*?)</tool_call>", re.IGNORECASE | re.DOTALL)
-    FENCED_JSON_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+    MAX_PARSE_CHARS = 32_000
+    TOOL_CALL_PATTERN = re.compile(
+        r"<tool_call>(.*?)</tool_call>", re.IGNORECASE | re.DOTALL
+    )
+    FENCED_JSON_PATTERN = re.compile(
+        r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL
+    )
 
     def parse(self, text: str) -> BrainGeneration:
         raw_text = text
+        if len(text) > self.MAX_PARSE_CHARS:
+            text = text[: self.MAX_PARSE_CHARS]
         tool_calls: list[ToolCall] = []
         consumed_spans: list[tuple[int, int]] = []
 
@@ -133,7 +139,9 @@ class ToolCallParser:
             key, value = line.split(separator, 1)
             fields[key.strip().lower()] = value.strip()
 
-        name = str(fields.get("name") or fields.get("tool") or fields.get("function") or "").strip()
+        name = str(
+            fields.get("name") or fields.get("tool") or fields.get("function") or ""
+        ).strip()
         if not name:
             return []
         arguments: dict[str, Any] = {}
@@ -262,7 +270,10 @@ class ToolCallParser:
         unique: list[ToolCall] = []
         seen: set[tuple[str, str]] = set()
         for call in tool_calls:
-            signature = (call.name, json.dumps(call.arguments, sort_keys=True, default=str))
+            signature = (
+                call.name,
+                json.dumps(call.arguments, sort_keys=True, default=str),
+            )
             if signature in seen:
                 continue
             seen.add(signature)
@@ -332,11 +343,17 @@ class PersonaGatedModel:
             request = request_or_history
         else:
             if user_message is None:
-                raise ValueError("user_message is required when passing conversation history.")
+                raise ValueError(
+                    "user_message is required when passing conversation history."
+                )
             inferred_blend = persona_blend or self.compute_blend(user_message)
             persona_prefix = self.persona_prefix(inferred_blend)
-            system_prompt = self._build_history_system_prompt(request_or_history, inferred_blend)
-            user_prompt = self._build_history_user_prompt(request_or_history, user_message)
+            system_prompt = self._build_history_system_prompt(
+                request_or_history, inferred_blend
+            )
+            user_prompt = self._build_history_user_prompt(
+                request_or_history, user_message
+            )
             request = LocalGenerationRequest(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
@@ -352,44 +369,43 @@ class PersonaGatedModel:
         return await asyncio.to_thread(self._generate_sync, request)
 
     def _load_model(self, path: Path) -> Any:
-        class MockLlama:
-            def __init__(self, *args, **kwargs):
-                pass
-            def __call__(self, *args, **kwargs):
-                mock_json = '''[
-  {
-    "task_name": "Write unit tests",
-    "description": "Write unit tests for the newly added module.",
-    "estimated_risk": 2,
-    "estimated_cost": 5
-  }
-]'''
-                return {
-                    "id": "mock_id",
-                    "choices": [
-                        {
-                            "message": {"content": mock_json, "role": "assistant"},
-                            "text": mock_json
-                        }
-                    ],
-                    "usage": {"total_tokens": 10}
-                }
-            def create_chat_completion(self, *args, **kwargs):
-                return self()
-            def tokenize(self, text, *args, **kwargs):
-                return [1] * len(text)
-            def eval(self, *args, **kwargs):
-                pass
-        return MockLlama()
+        resolved = Path(path).resolve()
+        if not resolved.exists():
+            self._load_error = f"Local model file does not exist: {resolved}"
+            return None
 
-    def _build_history_system_prompt(self, history: list[dict[str, str]], blend: dict[str, float]) -> str:
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            self._load_error = (
+                "llama-cpp-python is not installed, so local inference is unavailable."
+            )
+            return None
+
+        try:
+            return Llama(
+                model_path=str(resolved),
+                n_ctx=self.context_size,
+                n_threads=self.n_threads,
+                n_gpu_layers=self.n_gpu_layers,
+                verbose=False,
+            )
+        except Exception as exc:
+            self._load_error = f"Failed to load local model from {resolved}: {exc}"
+            return None
+
+    def _build_history_system_prompt(
+        self, history: list[dict[str, str]], blend: dict[str, float]
+    ) -> str:
         base = "You are LISA, a compact developer agent."
         for msg in history:
             if msg["role"] == "system":
                 base += "\n" + msg["content"]
         return base
 
-    def _build_history_user_prompt(self, history: list[dict[str, str]], user_message: str) -> str:
+    def _build_history_user_prompt(
+        self, history: list[dict[str, str]], user_message: str
+    ) -> str:
         out = ""
         for msg in history:
             if msg["role"] != "system":
@@ -398,22 +414,80 @@ class PersonaGatedModel:
         return out.strip()
 
     def _generate_sync(self, request: LocalGenerationRequest) -> BrainGeneration:
-        res = getattr(self._llama, "create_chat_completion", self._llama)(
-            messages=[
-                {"role": "system", "content": request.system_prompt},
-                {"role": "user", "content": request.user_prompt},
-            ],
-            max_tokens=request.max_tokens,
-            temperature=0.7,
-        )
-        msg = res["choices"][0]["message"]["content"]
-        from lisa.constitutions import ConstitutionMode
+        self._last_persona_prefix = request.persona_prefix
+        messages = [
+            {
+                "role": "system",
+                "content": self._system_prompt_with_persona_trigger(request),
+            },
+            {"role": "user", "content": request.user_prompt},
+        ]
+
+        backend = self._llama
+        if hasattr(backend, "create_chat_completion"):
+            response = backend.create_chat_completion(
+                messages=messages,
+                max_tokens=request.max_tokens,
+                temperature=0.2,
+                stop=["</s>", "<|eot_id|>"],
+            )
+        else:
+            prompt = (
+                f"System: {messages[0]['content']}\n"
+                f"User: {messages[1]['content']}\n"
+                "Assistant:"
+            )
+            response = backend(
+                prompt,
+                max_tokens=request.max_tokens,
+                temperature=0.2,
+                stop=["</s>", "User:"],
+            )
+
+        msg = self._extract_text_response(response)
         parsed = ToolCallParser().parse(msg)
         return BrainGeneration(
             text=parsed.text,
             tool_calls=parsed.tool_calls,
             raw_text=msg,
             used_local_model=True,
-            persona_prefix_shape=request.persona_prefix.shape if hasattr(request.persona_prefix, "shape") else None
+            persona_prefix_shape=(
+                request.persona_prefix.shape
+                if hasattr(request.persona_prefix, "shape")
+                else None
+            ),
         )
 
+    def _system_prompt_with_persona_trigger(
+        self, request: LocalGenerationRequest
+    ) -> str:
+        trigger = self._persona_trigger(request.persona_prefix)
+        if not trigger:
+            return request.system_prompt
+        return f"{request.system_prompt}\nPersona trigger: {trigger}"
+
+    @staticmethod
+    def _extract_text_response(response: Any) -> str:
+        if not isinstance(response, dict):
+            return str(response)
+        choices = response.get("choices") or []
+        if not choices:
+            return ""
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message")
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                return message["content"]
+            if isinstance(first.get("text"), str):
+                return first["text"]
+        return str(first)
+
+    @staticmethod
+    def _persona_trigger(persona_prefix: np.ndarray | None) -> str:
+        if persona_prefix is None:
+            return ""
+        array = np.asarray(persona_prefix, dtype=np.float32)
+        if array.size == 0:
+            return ""
+        digest = hashlib.sha256(array.tobytes()).hexdigest()[:24]
+        return f"persona::{digest}::shape={array.shape[0]}x{array.shape[1]}"

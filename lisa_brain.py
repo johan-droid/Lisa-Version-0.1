@@ -22,13 +22,16 @@ from lisa.gating import (
 from lisa.local_inference import PersonaGatedModel
 from lisa.soft_prompts import PersonaSoftPromptBank
 
-
 DEFAULT_CSV_PATH = Path("data") / "persona_training.csv"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the LISA brain heartbeat.")
-    parser.add_argument("prompt", nargs="?", help="User prompt for the brain. If omitted, stdin is used.")
+    parser.add_argument(
+        "prompt",
+        nargs="?",
+        help="User prompt for the brain. If omitted, stdin is used.",
+    )
     parser.add_argument(
         "--model-path",
         default=None,
@@ -117,7 +120,9 @@ def _build_settings(args: argparse.Namespace) -> Settings:
             settings.local_model_path = Path(env_model_path).expanduser().resolve()
 
     if args.persona_vectors_path:
-        settings.persona_vectors_path = Path(args.persona_vectors_path).expanduser().resolve()
+        settings.persona_vectors_path = (
+            Path(args.persona_vectors_path).expanduser().resolve()
+        )
     if args.gating_model_path:
         settings.gating_model_path = Path(args.gating_model_path).expanduser().resolve()
     if args.context_size is not None:
@@ -136,7 +141,9 @@ def _load_persona_bank(path: Path) -> PersonaSoftPromptBank:
     return bank
 
 
-def _load_or_train_gating_model(csv_path: Path, model_path: Path, force_train: bool) -> PersonaGatingNetwork:
+def _load_or_train_gating_model(
+    csv_path: Path, model_path: Path, force_train: bool
+) -> PersonaGatingNetwork:
     if force_train or not csv_path.exists():
         write_synthetic_persona_training_csv(csv_path, count=500)
     if force_train or not model_path.exists():
@@ -173,7 +180,9 @@ async def run_prompt(
     return await brain.generate([], prompt, blend, max_tokens=max_tokens)
 
 
-def build_brain(settings: Settings, gating_model: PersonaGatingNetwork) -> PersonaGatedModel:
+def build_brain(
+    settings: Settings, gating_model: PersonaGatingNetwork
+) -> PersonaGatedModel:
     if settings.local_model_path is None:
         raise RuntimeError(
             "No local model path configured. Provide --model-path or LISA_LOCAL_MODEL_PATH."
@@ -196,12 +205,24 @@ def main() -> None:
     prompt = _resolve_prompt(args)
 
     if getattr(args, "train_personas", False):
-        persona_csv = Path(getattr(args, "persona_training_csv", DEFAULT_CSV_PATH)).expanduser().resolve()
-        persona_tensor_path = Path(getattr(args, "persona_tensor_path", "data/personas.pt")).expanduser().resolve()
+        persona_csv = (
+            Path(getattr(args, "persona_training_csv", DEFAULT_CSV_PATH))
+            .expanduser()
+            .resolve()
+        )
+        persona_tensor_path = (
+            Path(getattr(args, "persona_tensor_path", "data/personas.pt"))
+            .expanduser()
+            .resolve()
+        )
         _train_phase1_persona_tensor(persona_csv, persona_tensor_path)
 
     if getattr(args, "train_gating_sklearn", False):
-        persona_csv = Path(getattr(args, "persona_training_csv", DEFAULT_CSV_PATH)).expanduser().resolve()
+        persona_csv = (
+            Path(getattr(args, "persona_training_csv", DEFAULT_CSV_PATH))
+            .expanduser()
+            .resolve()
+        )
         _train_phase1_gating_bundle(persona_csv, settings.gating_model_path)
 
     gating_model = _load_or_train_gating_model(

@@ -18,7 +18,9 @@ def test_notepad_interactions_are_searchable(tmp_path: Path) -> None:
             "channel": "telegram",
             "input": "Write a secure API endpoint",
             "output": "Implemented an authenticated endpoint.",
-            "tool_calls": [{"name": "search_notepad", "arguments": {"query": "secure"}}],
+            "tool_calls": [
+                {"name": "search_notepad", "arguments": {"query": "secure"}}
+            ],
             "persona_blend": {"architect": 0.7, "oracle": 0.3},
             "outcome": "success",
             "reward": 0.9,

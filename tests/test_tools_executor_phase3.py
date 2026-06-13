@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from cryptography.fernet import Fernet
 
-from tools.executor import EncryptedKeyVault, ProviderConfig, ToolExecutor, ToolResult
+from tools.executor import EncryptedKeyVault, ProviderConfig, ToolExecutor
 
 
 def test_executor_file_ops_dashboard_and_skill_registration(tmp_path: Path) -> None:
@@ -49,7 +49,9 @@ async def skill(**kwargs):
         assert invoked.data["echo"]["value"] == 7
 
     asyncio.run(run())
-    manifest = json.loads((tmp_path / "skills_manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (tmp_path / "skills_manifest.json").read_text(encoding="utf-8")
+    )
     assert "echo_skill" in manifest["skills"]
 
 
@@ -137,8 +139,14 @@ def test_browser_fetch_caches_and_parses(tmp_path: Path, monkeypatch) -> None:
             )
 
     monkeypatch.setattr("tools.executor.httpx.AsyncClient", FakeClient)
-    monkeypatch.setattr(executor, "_respect_robots", lambda parsed_url: asyncio.sleep(0))
-    monkeypatch.setattr(executor, "_throttle_domain", lambda domain, minimum_delay=0.35: asyncio.sleep(0))
+    monkeypatch.setattr(
+        executor, "_respect_robots", lambda parsed_url: asyncio.sleep(0)
+    )
+    monkeypatch.setattr(
+        executor,
+        "_throttle_domain",
+        lambda domain, minimum_delay=0.35: asyncio.sleep(0),
+    )
 
     async def run() -> None:
         first = await executor.browser_fetch("https://example.com/page")
@@ -148,7 +156,7 @@ def test_browser_fetch_caches_and_parses(tmp_path: Path, monkeypatch) -> None:
         assert first.success is True
         assert first.data["title"] == "Demo Page"
         assert "Hello world" in first.data["text"]
-        assert "print(\"hi\")" in first.data["code_blocks"][0]
+        assert 'print("hi")' in first.data["code_blocks"][0]
         assert second.data["title"] == "Demo Page"
         assert calls["count"] >= 1
         assert search.success is True
@@ -240,7 +248,12 @@ def test_mcp_call_uses_json_rpc(monkeypatch, tmp_path: Path) -> None:
         def write(self, data: bytes) -> None:
             self.buffer.append(data)
             request = json.loads(data.decode("utf-8").strip())
-            response = json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}}) + "\n"
+            response = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}}
+                )
+                + "\n"
+            )
             self.process.stdout.feed(response.encode("utf-8"))
 
         async def drain(self) -> None:
@@ -266,10 +279,14 @@ def test_mcp_call_uses_json_rpc(monkeypatch, tmp_path: Path) -> None:
     async def fake_create_subprocess_exec(*args, **kwargs):
         return FakeProcess()
 
-    monkeypatch.setattr("tools.executor.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(
+        "tools.executor.asyncio.create_subprocess_exec", fake_create_subprocess_exec
+    )
 
     async def run() -> None:
-        result = await executor.mcp_call("filesystem", "filesystem.read", {"path": "notes.txt"})
+        result = await executor.mcp_call(
+            "filesystem", "filesystem.read", {"path": "notes.txt"}
+        )
         assert result.success is True
         assert result.data["ok"] is True
 

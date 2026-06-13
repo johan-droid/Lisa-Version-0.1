@@ -15,4 +15,6 @@ class WellnessTracker:
     def should_check_in(self) -> bool:
         if self.start_time is None:
             return False
-        return (datetime.now(timezone.utc) - self.start_time) >= timedelta(minutes=self.break_after_minutes)
+        return (datetime.now(timezone.utc) - self.start_time) >= timedelta(
+            minutes=self.break_after_minutes
+        )

@@ -1,7 +1,25 @@
 app_name: LISA
+agent_id: lisa
 workspace_root: .
 model_path: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+redis_url: ""
+postgres_dsn: ""
+chroma_persist_dir: data/chroma
+working_memory_ttl_seconds: 7200
 max_concurrent_arms: 10
+admin_api_token: ""
+enable_unsafe_admin_endpoints: false
+autonomous_enabled: false
+message_hub_start_listener: false
+allow_local_terminal_fallback: false
+hybrid_brain_enabled: true
+hybrid_brain_stress_threshold: 4
+hybrid_brain_prompt_chars_threshold: 600
+hybrid_brain_race_window_ms: 250
+evolution_skill_autoload_limit: 2
+telegram_allowed_user_ids: []
+slack_allowed_user_ids: []
+whatsapp_allowed_user_ids: []
 interface_keys:
   telegram_secret: ""
   telegram_bot_token: ""
@@ -36,12 +54,15 @@ proactive_checkin_minutes: 120
 settings:
   db_path: data/lisa_notepad.db
   skills_dir: skills
+  evolution_artifacts_dir: data/evolution_artifacts
   persona_vectors_path: data/persona_vectors.npz
   gating_model_path: data/gating_model.pkl
   message_hub_enabled: true
   message_hub_host: localhost
   message_hub_port: 8800
+  message_hub_start_listener: false
   evolution_enabled: true
+  autonomous_enabled: false
   evolution_check_interval_seconds: 1800
   evolution_window_start_hour: 2
   evolution_window_duration_hours: 3
@@ -50,6 +71,11 @@ settings:
   evolution_browser_queries: 2
   evolution_min_reward: 0.35
   enable_browser_tools: true
+  hybrid_brain_enabled: true
+  hybrid_brain_stress_threshold: 4
+  hybrid_brain_prompt_chars_threshold: 600
+  hybrid_brain_race_window_ms: 250
+  evolution_skill_autoload_limit: 2
 
 constitutions:
   restricted: |

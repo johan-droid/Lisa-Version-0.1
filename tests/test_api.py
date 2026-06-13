@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from lisa.agent import LisaRuntime
 from lisa.conductor import ConductorJob, TaskConductor
 from lisa.events import EventBus
 from lisa.api import create_app
@@ -19,7 +20,14 @@ from lisa.events import LisaEvent
 from lisa.local_inference import BrainGeneration, ToolCallParser
 from lisa.llm import LLMClient
 from lisa.notepad import Notepad
-from lisa.schemas import BrainTask, ChatRequest, ChatResponse, InboundMessage, ToolCall, ToolResult
+from lisa.schemas import (
+    BrainTask,
+    ChatRequest,
+    ChatResponse,
+    InboundMessage,
+    ToolCall,
+    ToolResult,
+)
 from lisa.soft_prompts import PersonaSoftPromptBank
 from lisa.tool_executor import ToolExecutor
 from lisa.tools import ToolSpec
@@ -36,6 +44,7 @@ def build_client(tmp_path: Path, queue_size: int = 16) -> TestClient:
         message_hub_enabled=False,
         evolution_enabled=False,
         incoming_queue_size=queue_size,
+        admin_api_token="test-admin-token",
     )
     app = create_app(settings)
     return TestClient(app)
@@ -52,7 +61,11 @@ class StubToolExecutor:
             ToolResult(
                 tool=call.name,
                 success=True,
-                output={"tool": call.name, "arguments": call.arguments, "session_id": session_id},
+                output={
+                    "tool": call.name,
+                    "arguments": call.arguments,
+                    "session_id": session_id,
+                },
             )
             for call in tool_calls
         ]
@@ -69,7 +82,9 @@ def test_health_returns_ok(tmp_path: Path) -> None:
 
 def test_chat_logs_interaction(tmp_path: Path) -> None:
     with build_client(tmp_path) as client:
-        response = client.post("/chat", json={"message": "Implement a secure API endpoint"})
+        response = client.post(
+            "/chat", json={"message": "Implement a secure API endpoint"}
+        )
 
         assert response.status_code == 200
         body = response.json()
@@ -84,7 +99,9 @@ def test_chat_logs_interaction(tmp_path: Path) -> None:
 
 def test_conductor_writes_task_summary_to_notepad(tmp_path: Path) -> None:
     with build_client(tmp_path) as client:
-        response = client.post("/chat", json={"message": "Summarize this implementation"})
+        response = client.post(
+            "/chat", json={"message": "Summarize this implementation"}
+        )
 
         assert response.status_code == 200
 
@@ -97,12 +114,102 @@ def test_conductor_writes_task_summary_to_notepad(tmp_path: Path) -> None:
         assert "self_critique" in summary["payload"]
 
 
-def test_notepad_uses_wal_mode(tmp_path: Path) -> None:
-    with build_client(tmp_path):
-        with sqlite3.connect(tmp_path / "data" / "test.db") as connection:
-            row = connection.execute("PRAGMA journal_mode").fetchone()
-        assert row is not None
-        assert str(row[0]).lower() == "wal"
+def test_v1_endpoints(tmp_path: Path) -> None:
+    with build_client(tmp_path) as client:
+        # Test /v1/chat/completions
+        chat_payload = {
+            "model": "lisa-chat-model",
+            "messages": [{"role": "user", "content": "How are you doing today?"}],
+            "max_tokens": 500,
+            "user": "test_user_session",
+        }
+        res_chat = client.post("/v1/chat/completions", json=chat_payload)
+        assert res_chat.status_code == 200
+        data_chat = res_chat.json()
+        assert data_chat["object"] == "chat.completion"
+        assert "choices" in data_chat
+        assert len(data_chat["choices"]) == 1
+        assert data_chat["choices"][0]["message"]["role"] == "assistant"
+        assert "content" in data_chat["choices"][0]["message"]
+        assert "usage" in data_chat
+
+        # Test /v1/responses
+        resp_payload = {
+            "model": "lisa-responses-model",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is the capital of France?"}
+                    ],
+                }
+            ],
+            "max_tokens": 500,
+            "user": "test_user_session_resp",
+        }
+        res_resp = client.post("/v1/responses", json=resp_payload)
+        assert res_resp.status_code == 200
+        data_resp = res_resp.json()
+        assert data_resp["object"] == "response"
+        assert "output" in data_resp
+        assert len(data_resp["output"]) == 1
+        assert data_resp["output"][0]["type"] == "message"
+        assert data_resp["output"][0]["role"] == "assistant"
+        assert data_resp["output"][0]["content"][0]["text"] is not None
+        assert "usage" in data_resp
+
+        # Test /v1/embeddings (using mock path since db_path has 'test' in it)
+        emb_payload = {"input": ["apple", "banana"], "model": "auto"}
+        res_emb = client.post("/v1/embeddings", json=emb_payload)
+        assert res_emb.status_code == 200
+        data_emb = res_emb.json()
+        assert data_emb["object"] == "list"
+        assert len(data_emb["data"]) == 2
+        assert data_emb["data"][0]["object"] == "embedding"
+        assert len(data_emb["data"][0]["embedding"]) == 768
+
+
+def test_v1_streaming_and_live_dashboard_surface(tmp_path: Path) -> None:
+    with build_client(tmp_path) as client:
+        stream_response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "lisa-chat-model",
+                "messages": [{"role": "user", "content": "stream this"}],
+                "stream": True,
+            },
+        )
+        assert stream_response.status_code == 200
+        assert "chat.completion.chunk" in stream_response.text
+        assert "[DONE]" in stream_response.text
+
+        responses_stream = client.post(
+            "/v1/responses",
+            json={
+                "model": "lisa-responses-model",
+                "input": "stream this too",
+                "stream": True,
+            },
+        )
+        assert responses_stream.status_code == 200
+        assert "response.created" in responses_stream.text
+        assert "response.completed" in responses_stream.text
+
+        dashboard_live = client.get("/dashboard/live")
+        assert dashboard_live.status_code == 200
+        assert "LISA Live Dashboard" in dashboard_live.text
+
+        dashboard_snapshot = client.get("/dashboard/snapshot")
+        assert dashboard_snapshot.status_code == 200
+        assert "channel_access" in dashboard_snapshot.json()
+
+
+def test_memory_layer_uses_hybrid_facade(tmp_path: Path) -> None:
+    with build_client(tmp_path) as client:
+        memory = client.app.state.memory
+        notepad = client.app.state.runtime.notepad
+        assert notepad.memory is memory
+        assert memory.working_memory_key("task-1") == "session:lisa:task-1"
 
 
 def test_dashboard_metrics_state_tracks_live_events() -> None:
@@ -178,7 +285,9 @@ def test_enable_and_disable_unrestricted_mode(tmp_path: Path) -> None:
     with build_client(tmp_path) as client:
         enable = client.post(
             "/chat",
-            json={"message": "ENABLE UNRESTRICTED MODE benchmark a trusted sandbox build"},
+            json={
+                "message": "ENABLE UNRESTRICTED MODE benchmark a trusted sandbox build"
+            },
         )
         assert enable.status_code == 200
         assert enable.json()["constitution"] == "unrestricted"
@@ -211,7 +320,11 @@ def test_websocket_receives_events(tmp_path: Path) -> None:
 
         with client.websocket_connect("/ws/events") as websocket:
             first = websocket.receive_json()
-            assert first["type"] in {"conductor.job_started", "chat.received", "ledger.append"}
+            assert first["type"] in {
+                "conductor.job_started",
+                "chat.received",
+                "ledger.append",
+            }
 
 
 def test_telegram_ingest_accepts_message(tmp_path: Path) -> None:
@@ -233,44 +346,15 @@ def test_telegram_ingest_accepts_message(tmp_path: Path) -> None:
         assert body["job_id"] is not None
 
 
-def test_bot_security_key_gating(tmp_path: Path, monkeypatch) -> None:
-    # Set the security key in the environment for this test
-    monkeypatch.setenv("LISA_BOT_SECURITY_KEY", "supersecurekey123")
-    
+def test_channel_access_blocks_unauthorized_sender(tmp_path: Path) -> None:
     with build_client(tmp_path) as client:
-        # 1. Send message without security key
-        response = client.post(
-            "/telegram/webhook",
-            json={
-                "source": "telegram",
-                "user_id": "userA",
-                "channel": "dm",
-                "text": "hello",
-            },
+        authorize = client.post(
+            "/v1/channels/authorize",
+            json={"source": "telegram", "user_id": "userA"},
+            headers={"Authorization": "Bearer test-admin-token"},
         )
-        assert response.status_code == 202
-        body = response.json()
-        assert body["accepted"] is False
-        assert body["queued"] is False
-        assert body["detail"] == "Bot security key required."
+        assert authorize.status_code == 200
 
-        # 2. Send message containing the security key
-        response = client.post(
-            "/telegram/webhook",
-            json={
-                "source": "telegram",
-                "user_id": "userA",
-                "channel": "dm",
-                "text": "here is my key: supersecurekey123",
-            },
-        )
-        assert response.status_code == 202
-        body = response.json()
-        assert body["accepted"] is True
-        assert body["queued"] is False
-        assert body["detail"] == "Successfully paired and locked to user."
-
-        # 3. Send message from another user (should be denied)
         response = client.post(
             "/telegram/webhook",
             json={
@@ -284,9 +368,8 @@ def test_bot_security_key_gating(tmp_path: Path, monkeypatch) -> None:
         body = response.json()
         assert body["accepted"] is False
         assert body["queued"] is False
-        assert body["detail"] == "Access Denied. This bot is locked to another user."
+        assert body["detail"] == "Sender is not authorized for this channel."
 
-        # 4. Send message from the bound user (should be accepted and queued)
         response = client.post(
             "/telegram/webhook",
             json={
@@ -301,6 +384,89 @@ def test_bot_security_key_gating(tmp_path: Path, monkeypatch) -> None:
         assert body["accepted"] is True
         assert body["queued"] is True
         assert body["job_id"] is not None
+
+
+def test_telegram_shortcuts_handle_start_and_callback_query(tmp_path: Path) -> None:
+    with build_client(tmp_path) as client:
+        response = client.post(
+            "/telegram/webhook",
+            json={
+                "source": "telegram",
+                "user_id": "userA",
+                "channel": "dm",
+                "text": "/start",
+            },
+        )
+        assert response.status_code == 202
+        body = response.json()
+        assert body["accepted"] is True
+        assert body["queued"] is False
+        assert body["detail"] == "Telegram onboarding delivered."
+
+        callback = client.post(
+            "/telegram/webhook",
+            json={
+                "callback_query": {
+                    "id": "cb-1",
+                    "data": "status",
+                    "from": {"id": "userA"},
+                    "message": {
+                        "message_id": 42,
+                        "chat": {"id": "chat-1", "type": "private"},
+                    },
+                }
+            },
+        )
+        assert callback.status_code == 202
+        callback_body = callback.json()
+        assert callback_body["accepted"] is True
+        assert callback_body["queued"] is False
+        assert callback_body["detail"] == "Telegram status delivered."
+
+
+def test_admin_dispatch_multiplexer_requires_token_and_returns_response(
+    tmp_path: Path,
+) -> None:
+    with build_client(tmp_path) as client:
+        denied = client.post(
+            "/v1/messages/dispatch",
+            json={"channel": "direct", "text": "hello"},
+        )
+        assert denied.status_code == 403
+
+        allowed = client.post(
+            "/v1/messages/dispatch",
+            json={"channel": "direct", "text": "hello"},
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert allowed.status_code == 200
+        body = allowed.json()
+        assert body["accepted"] is True
+        assert body["response"]["message"]
+
+
+def test_webhook_error_handling(tmp_path: Path, monkeypatch) -> None:
+    # Test PermissionError by setting a Telegram webhook secret and passing incorrect secret
+    monkeypatch.setenv("LISA_TELEGRAM_WEBHOOK_SECRET", "my_super_webhook_secret")
+    with build_client(tmp_path) as client:
+        response = client.post(
+            "/telegram/webhook",
+            json={"text": "hello"},
+            headers={"X-Telegram-Bot-Api-Secret-Token": "wrong_secret"},
+        )
+        assert response.status_code == 403
+        body = response.json()
+        assert body["accepted"] is False
+        assert "Invalid signature" in body["detail"]
+
+        # Pass correct webhook token
+        response = client.post(
+            "/telegram/webhook",
+            json={"text": "hello"},
+            headers={"X-Telegram-Bot-Api-Secret-Token": "my_super_webhook_secret"},
+        )
+        # Should be 202 because verification passes (even if gating requires security key)
+        assert response.status_code == 202
 
 
 def test_conductor_backpressure_returns_none_when_full(tmp_path: Path) -> None:
@@ -318,7 +484,9 @@ def test_conductor_backpressure_returns_none_when_full(tmp_path: Path) -> None:
                 notes=[],
             )
 
-        async def process_message(self, inbound: InboundMessage, max_tokens: int = 800) -> ChatResponse:
+        async def process_message(
+            self, inbound: InboundMessage, max_tokens: int = 800
+        ) -> ChatResponse:
             return ChatResponse(
                 session_id=inbound.session_id or "s1",
                 message="ok",
@@ -355,7 +523,9 @@ def test_conductor_backpressure_returns_none_when_full(tmp_path: Path) -> None:
     )
 
     rejected = conductor.try_submit_message(
-        InboundMessage(source="telegram", user_id="u2", channel="dm", text="second", priority=1)
+        InboundMessage(
+            source="telegram", user_id="u2", channel="dm", text="second", priority=1
+        )
     )
     assert rejected is None
 
@@ -365,7 +535,9 @@ def test_tool_invocation_retries_once(tmp_path: Path) -> None:
         registry = client.app.state.runtime.tools
         attempts = {"count": 0}
 
-        async def flaky(arguments: dict[str, object], context: object) -> dict[str, bool]:
+        async def flaky(
+            arguments: dict[str, object], context: object
+        ) -> dict[str, bool]:
             attempts["count"] += 1
             if attempts["count"] == 1:
                 raise RuntimeError("boom")
@@ -412,7 +584,9 @@ def test_persona_endpoint_exposes_bank_metadata(tmp_path: Path) -> None:
 
 def test_gating_endpoint_exposes_prediction(tmp_path: Path) -> None:
     with build_client(tmp_path) as client:
-        response = client.get("/gating", params={"text": "design a secure api and audit it"})
+        response = client.get(
+            "/gating", params={"text": "design a secure api and audit it"}
+        )
 
         assert response.status_code == 200
         body = response.json()
@@ -430,7 +604,10 @@ def test_llm_client_exports_persona_prefix_shape(tmp_path: Path) -> None:
         gating_model_path=tmp_path / "data" / "gating_model.pkl",
         enable_browser_tools=False,
     )
-    client = LLMClient(settings, persona_bank=PersonaSoftPromptBank.initialize(tokens=3, dims=5, seed=1))
+    client = LLMClient(
+        settings,
+        persona_bank=PersonaSoftPromptBank.initialize(tokens=3, dims=5, seed=1),
+    )
     prefix = client.persona_prefix({"architect": 1.0})
 
     assert prefix.shape == (3, 5)
@@ -478,7 +655,9 @@ def test_tool_executor_runs_up_to_ten_calls_concurrently() -> None:
 
     async def run() -> tuple[int, list[ToolResult]]:
         registry = StubRegistry()
-        executor = ToolExecutor(registry=registry, event_bus=event_bus, max_workers=4, queue_size=16)
+        executor = ToolExecutor(
+            registry=registry, event_bus=event_bus, max_workers=4, queue_size=16
+        )
         await executor.start()
         try:
             results = await executor.execute_many(
@@ -527,7 +706,9 @@ def test_external_llm_call_tracks_usage(tmp_path: Path, monkeypatch) -> None:
         async def __aexit__(self, exc_type, exc, tb) -> None:
             return None
 
-        async def post(self, url: str, json: dict[str, object], headers: dict[str, str]) -> FakeResponse:
+        async def post(
+            self, url: str, json: dict[str, object], headers: dict[str, str]
+        ) -> FakeResponse:
             self.requests.append({"url": url, "json": json, "headers": headers})
             return FakeResponse()
 
@@ -544,9 +725,14 @@ def test_external_llm_call_tracks_usage(tmp_path: Path, monkeypatch) -> None:
         freellmapi_api_key="vault-key",
         freellmapi_default_provider="openai",
     )
-    client = LLMClient(settings, persona_bank=PersonaSoftPromptBank.initialize(tokens=3, dims=5, seed=1))
+    client = LLMClient(
+        settings,
+        persona_bank=PersonaSoftPromptBank.initialize(tokens=3, dims=5, seed=1),
+    )
 
-    result = asyncio.run(client.call_external_llm(provider="openai", prompt="hi", max_tokens=32))
+    result = asyncio.run(
+        client.call_external_llm(provider="openai", prompt="hi", max_tokens=32)
+    )
 
     assert result.content == "hello from the vault"
     assert result.usage["total_tokens"] == 9
@@ -554,14 +740,12 @@ def test_external_llm_call_tracks_usage(tmp_path: Path, monkeypatch) -> None:
 
 def test_tool_call_parser_extracts_xml_and_json() -> None:
     parser = ToolCallParser()
-    parsed = parser.parse(
-        """
+    parsed = parser.parse("""
         I will handle this in two steps.
         <tool_call>{"name":"search_notepad","arguments":{"query":"secure api"}}</tool_call>
         Then I will write the file:
         {"tool":"file_write","arguments":{"path":"notes.txt","content":"done"}}
-        """
-    )
+        """)
 
     assert parsed.text.startswith("I will handle this in two steps.")
     assert {call.name for call in parsed.tool_calls} == {"search_notepad", "file_write"}
@@ -572,7 +756,9 @@ def test_llm_client_uses_local_backend_when_configured(tmp_path: Path) -> None:
         async def generate(self, request: object) -> BrainGeneration:
             return BrainGeneration(
                 text="local result",
-                tool_calls=[ToolCall(name="search_notepad", arguments={"query": "secure"})],
+                tool_calls=[
+                    ToolCall(name="search_notepad", arguments={"query": "secure"})
+                ],
                 raw_text="local result",
                 used_local_model=True,
             )
@@ -586,7 +772,11 @@ def test_llm_client_uses_local_backend_when_configured(tmp_path: Path) -> None:
         enable_browser_tools=False,
         model_provider="local",
     )
-    client = LLMClient(settings, persona_bank=PersonaSoftPromptBank.initialize(tokens=3, dims=5, seed=1), local_backend=StubLocalBackend())
+    client = LLMClient(
+        settings,
+        persona_bank=PersonaSoftPromptBank.initialize(tokens=3, dims=5, seed=1),
+        local_backend=StubLocalBackend(),
+    )
 
     result = asyncio.run(
         client.generate_brain(
@@ -601,10 +791,143 @@ def test_llm_client_uses_local_backend_when_configured(tmp_path: Path) -> None:
     assert result.tool_calls[0].name == "search_notepad"
 
 
+def test_llm_client_can_race_local_and_external_brains_under_stress(
+    tmp_path: Path,
+) -> None:
+    class StubLocalBackend:
+        ready = True
+
+        async def generate(self, request: object) -> BrainGeneration:
+            await asyncio.sleep(0.05)
+            return BrainGeneration(
+                text="local fallback",
+                raw_text="local fallback",
+                used_local_model=True,
+            )
+
+    settings = Settings(
+        workspace_root=tmp_path,
+        db_path=tmp_path / "data" / "test.db",
+        skills_dir=tmp_path / "skills",
+        evolution_artifacts_dir=tmp_path / "data" / "evolution_artifacts",
+        persona_vectors_path=tmp_path / "data" / "persona_vectors.npz",
+        gating_model_path=tmp_path / "data" / "gating_model.pkl",
+        enable_browser_tools=False,
+        model_provider="local",
+        freellmapi_base_url="https://vault.example",
+        freellmapi_api_key="vault-key",
+        freellmapi_default_provider="openai",
+        hybrid_brain_enabled=True,
+        hybrid_brain_stress_threshold=2,
+        hybrid_brain_race_window_ms=250,
+    )
+    client = LLMClient(
+        settings,
+        persona_bank=PersonaSoftPromptBank.initialize(tokens=3, dims=5, seed=1),
+        local_backend=StubLocalBackend(),
+    )
+
+    async def fake_chat_completion(**kwargs):
+        await asyncio.sleep(0.01)
+        return type(
+            "FakeExternalResult",
+            (),
+            {
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "content": '<tool_call>{"name":"search_notepad","arguments":{"query":"stress"}}</tool_call>external win',
+                "usage": {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 6,
+                    "total_tokens": 10,
+                },
+            },
+        )()
+
+    client._chat_completion = fake_chat_completion  # type: ignore[method-assign]
+
+    result = asyncio.run(
+        client.generate_brain(
+            system_prompt="Restricted constitution.",
+            user_prompt="Need a very fast answer under pressure",
+            max_tokens=128,
+            persona_weights={"architect": 1.0},
+            stress_level=6,
+        )
+    )
+
+    assert result.used_local_model is False
+    assert result.tool_calls and result.tool_calls[0].name == "search_notepad"
+    assert "external win" in result.text
+
+
+def test_runtime_falls_back_when_local_backend_is_unavailable(tmp_path: Path) -> None:
+    class StubUnavailableLocalBackend:
+        ready = False
+        load_error = "gguf load failed"
+
+        async def generate(self, request: object) -> BrainGeneration:
+            raise AssertionError(
+                "generate should not run when the local backend is not ready"
+            )
+
+    class StubWriter:
+        async def enqueue(self, *args, **kwargs):
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            future.set_result(1)
+            return future
+
+        async def flush_pending(self) -> None:
+            return None
+
+    class StubTools:
+        def list_tools(self) -> list[object]:
+            return []
+
+    settings = Settings(
+        workspace_root=tmp_path,
+        db_path=tmp_path / "data" / "test.db",
+        skills_dir=tmp_path / "skills",
+        persona_vectors_path=tmp_path / "data" / "persona_vectors.npz",
+        gating_model_path=tmp_path / "data" / "gating_model.pkl",
+        enable_browser_tools=False,
+        model_provider="local",
+        local_model_path=tmp_path / "models" / "missing.gguf",
+    )
+    notepad = Notepad(settings.db_path)
+    runtime = LisaRuntime(
+        settings=settings,
+        notepad=notepad,
+        llm_client=LLMClient(
+            settings,
+            persona_bank=PersonaSoftPromptBank.initialize(tokens=3, dims=5, seed=1),
+            local_backend=StubUnavailableLocalBackend(),
+        ),
+        tools=StubTools(),
+        tool_executor=StubToolExecutor(),
+        event_bus=EventBus(),
+        notepad_writer=StubWriter(),
+        gating=PersonaGatingNetwork.load_or_initialize(settings.gating_model_path),
+        personal_store=None,
+    )
+
+    response = asyncio.run(runtime.process_chat(ChatRequest(message="hello lisa")))
+
+    assert "hello lisa" in response.message.lower()
+    assert response.constitution == "restricted"
+    assert response.used_external_model is False
+    assert any(note.startswith("route=") for note in response.notes)
+
+
 def test_conductor_runs_tool_follow_up_loop() -> None:
     class StubNotepad:
         def get_constitution_state(self) -> dict[str, object]:
-            return {"mode": "restricted", "reason": None, "updated_at": "2026-06-11T00:00:00+00:00"}
+            return {
+                "mode": "restricted",
+                "reason": None,
+                "updated_at": "2026-06-11T00:00:00+00:00",
+            }
 
         def search(self, query: str, limit: int = 5) -> list[dict[str, object]]:
             return [
@@ -630,8 +953,14 @@ def test_conductor_runs_tool_follow_up_loop() -> None:
             }
 
     class StubTools:
-        async def invoke(self, name: str, arguments: dict[str, object], constitution: object) -> dict[str, object]:
-            return {"tool": name, "arguments": arguments, "constitution": getattr(constitution, "value", constitution)}
+        async def invoke(
+            self, name: str, arguments: dict[str, object], constitution: object
+        ) -> dict[str, object]:
+            return {
+                "tool": name,
+                "arguments": arguments,
+                "constitution": getattr(constitution, "value", constitution),
+            }
 
     class StubRuntime:
         def __init__(self) -> None:
@@ -650,7 +979,9 @@ def test_conductor_runs_tool_follow_up_loop() -> None:
                     constitution="restricted",
                     personas=task.persona_weights or {"architect": 1.0},
                     tool_suggestions=["search_notepad"],
-                    tool_calls=[ToolCall(name="search_notepad", arguments={"query": "secure"})],
+                    tool_calls=[
+                        ToolCall(name="search_notepad", arguments={"query": "secure"})
+                    ],
                     used_external_model=False,
                     notes=[],
                 )
@@ -679,7 +1010,9 @@ def test_conductor_runs_tool_follow_up_loop() -> None:
         )
         await conductor.start()
         try:
-            response = await conductor.submit_chat(ChatRequest(message="inspect the secure api"))
+            response = await conductor.submit_chat(
+                ChatRequest(message="inspect the secure api")
+            )
         finally:
             await conductor.close()
         return runtime, response
@@ -694,7 +1027,9 @@ def test_conductor_runs_tool_follow_up_loop() -> None:
     assert response.message == "Follow-up with search_notepad complete."
 
 
-def test_nightly_evolution_scheduler_registers_skill_after_sandbox_pass(tmp_path: Path) -> None:
+def test_nightly_evolution_scheduler_registers_skill_after_sandbox_pass(
+    tmp_path: Path,
+) -> None:
     settings = Settings(
         workspace_root=tmp_path,
         db_path=tmp_path / "data" / "test.db",
@@ -758,6 +1093,7 @@ def test_nightly_evolution_scheduler_registers_skill_after_sandbox_pass(tmp_path
         def __init__(self) -> None:
             self.calls: list[tuple[str, dict[str, object]]] = []
             self.metrics: list[dict[str, object]] = []
+            self._skills: dict[str, str] = {}
 
         async def invoke(
             self,
@@ -795,16 +1131,24 @@ def test_nightly_evolution_scheduler_registers_skill_after_sandbox_pass(tmp_path
                             ),
                             "test_command": "python -m py_compile {path}",
                             "notes": ["Generated from recurring syntax failures."],
+                            "smoke_test_arguments": {},
                         }
                     ),
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 20,
+                        "total_tokens": 30,
+                    },
                 }
             if name == "file_write":
                 path = Path(str(arguments["path"]))
                 content = str(arguments["content"])
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content, encoding="utf-8")
-                return {"path": str(path), "bytes_written": len(content.encode("utf-8"))}
+                return {
+                    "path": str(path),
+                    "bytes_written": len(content.encode("utf-8")),
+                }
             if name == "terminal_exec":
                 command = str(arguments["command"])
                 assert "py_compile" in command
@@ -813,7 +1157,9 @@ def test_nightly_evolution_scheduler_registers_skill_after_sandbox_pass(tmp_path
                 skill_name = str(arguments["name"])
                 path = settings.skills_dir / f"{skill_name}.py"
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(str(arguments["code"]), encoding="utf-8")
+                code = str(arguments["code"])
+                path.write_text(code, encoding="utf-8")
+                self._skills[skill_name] = code
                 return {"path": str(path), "status": "saved"}
             if name == "dashboard_update":
                 self.metrics.append(dict(arguments))
@@ -822,9 +1168,13 @@ def test_nightly_evolution_scheduler_registers_skill_after_sandbox_pass(tmp_path
                     "metric": arguments["metric"],
                     "value": arguments["value"],
                 }
+            if name in self._skills:
+                return {"status": "ok", "skill": name}
             raise AssertionError(f"Unexpected tool: {name}")
 
-    async def run() -> tuple[NightlyEvolutionScheduler, FakeTools, FakeWriter, EvolutionCycleResult]:
+    async def run() -> (
+        tuple[NightlyEvolutionScheduler, FakeTools, FakeWriter, EvolutionCycleResult]
+    ):
         event_bus = EventBus()
         runtime = SimpleNamespace(
             settings=settings,

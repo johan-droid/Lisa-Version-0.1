@@ -18,7 +18,9 @@ def test_evolution_scheduler_skips_when_recent_user_activity(tmp_path: Path) -> 
         def latest_interaction_timestamp(self) -> datetime:
             return now - timedelta(minutes=10)
 
-        def recent_failure_interactions(self, limit: int = 24, min_reward: float = 0.35):
+        def recent_failure_interactions(
+            self, limit: int = 24, min_reward: float = 0.35
+        ):
             return [
                 {
                     "id": 1,
@@ -54,7 +56,15 @@ def test_evolution_scheduler_skips_when_recent_user_activity(tmp_path: Path) -> 
 
     class StubTools:
         async def invoke(self, *args, **kwargs):
-            return {"content": json.dumps({"name": "retry_guard", "code": "def retry_guard(context):\n    return True", "test_command": "python -m py_compile {path}"})}
+            return {
+                "content": json.dumps(
+                    {
+                        "name": "retry_guard",
+                        "code": "def retry_guard(context):\n    return True",
+                        "test_command": "python -m py_compile {path}",
+                    }
+                )
+            }
 
     settings = Settings(
         workspace_root=tmp_path,
@@ -76,7 +86,12 @@ def test_evolution_scheduler_skips_when_recent_user_activity(tmp_path: Path) -> 
         notepad_writer=StubWriter(),
         tools=StubTools(),
     )
-    scheduler = NightlyEvolutionScheduler(runtime=runtime, conductor=StubConductor(), event_bus=EventBus(), clock=lambda: now)
+    scheduler = NightlyEvolutionScheduler(
+        runtime=runtime,
+        conductor=StubConductor(),
+        event_bus=EventBus(),
+        clock=lambda: now,
+    )
 
     result = asyncio.run(scheduler.run_once())
 
@@ -92,7 +107,9 @@ def test_evolution_scheduler_runs_more_aggressively_at_night(tmp_path: Path) -> 
         def latest_interaction_timestamp(self) -> datetime:
             return now - timedelta(minutes=10)
 
-        def recent_failure_interactions(self, limit: int = 24, min_reward: float = 0.35):
+        def recent_failure_interactions(
+            self, limit: int = 24, min_reward: float = 0.35
+        ):
             return [
                 {
                     "id": 1,
@@ -120,7 +137,15 @@ def test_evolution_scheduler_runs_more_aggressively_at_night(tmp_path: Path) -> 
         def __init__(self) -> None:
             self.records: list[dict[str, object]] = []
 
-        async def enqueue(self, entry_type: str, payload: dict[str, object], constitution: object, personas=None, critique=None, reward=None):
+        async def enqueue(
+            self,
+            entry_type: str,
+            payload: dict[str, object],
+            constitution: object,
+            personas=None,
+            critique=None,
+            reward=None,
+        ):
             loop = asyncio.get_running_loop()
             future = loop.create_future()
             self.records.append({"entry_type": entry_type, "payload": payload})
@@ -133,8 +158,11 @@ def test_evolution_scheduler_runs_more_aggressively_at_night(tmp_path: Path) -> 
     class StubTools:
         def __init__(self) -> None:
             self.calls: list[tuple[str, dict[str, object]]] = []
+            self._skills: dict[str, str] = {}
 
-        async def invoke(self, name: str, arguments: dict[str, object], constitution: object):
+        async def invoke(
+            self, name: str, arguments: dict[str, object], constitution: object
+        ):
             self.calls.append((name, arguments))
             if name == "call_external_llm":
                 prompt = str(arguments.get("prompt", ""))
@@ -152,6 +180,7 @@ def test_evolution_scheduler_runs_more_aggressively_at_night(tmp_path: Path) -> 
                                 ),
                                 "test_command": "python -m py_compile {path}",
                                 "notes": ["Nightly synthesis."],
+                                "smoke_test_arguments": {},
                             }
                         ),
                         "usage": {"total_tokens": 15},
@@ -159,23 +188,32 @@ def test_evolution_scheduler_runs_more_aggressively_at_night(tmp_path: Path) -> 
                 return {
                     "provider": "openai",
                     "model": "gpt-4o-mini",
-                    "content": json.dumps({"insight": "retry", "pattern": "bounded retry"}),
+                    "content": json.dumps(
+                        {"insight": "retry", "pattern": "bounded retry"}
+                    ),
                     "usage": {"total_tokens": 5},
                 }
             if name == "file_write":
                 path = Path(str(arguments["path"]))
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(str(arguments["content"]), encoding="utf-8")
-                return {"path": str(path), "bytes_written": len(str(arguments["content"]).encode("utf-8"))}
+                return {
+                    "path": str(path),
+                    "bytes_written": len(str(arguments["content"]).encode("utf-8")),
+                }
             if name == "terminal_exec":
                 return {"returncode": 0, "stdout": "compiled", "stderr": ""}
             if name == "add_skill":
                 path = skill_path
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(str(arguments["code"]), encoding="utf-8")
+                code = str(arguments["code"])
+                path.write_text(code, encoding="utf-8")
+                self._skills[str(arguments["name"])] = code
                 return {"path": str(path), "status": "saved"}
             if name == "dashboard_update":
                 return {"status": "ok"}
+            if name in self._skills:
+                return {"status": "ok", "skill": name}
             raise AssertionError(name)
 
     settings = Settings(
@@ -199,7 +237,12 @@ def test_evolution_scheduler_runs_more_aggressively_at_night(tmp_path: Path) -> 
         notepad_writer=StubWriter(),
         tools=StubTools(),
     )
-    scheduler = NightlyEvolutionScheduler(runtime=runtime, conductor=StubConductor(), event_bus=EventBus(), clock=lambda: now)
+    scheduler = NightlyEvolutionScheduler(
+        runtime=runtime,
+        conductor=StubConductor(),
+        event_bus=EventBus(),
+        clock=lambda: now,
+    )
 
     result = asyncio.run(scheduler.run_once())
 

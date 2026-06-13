@@ -9,7 +9,9 @@ from utils.config_loader import load_config
 from utils.encryption import load_api_keys, save_api_keys
 
 
-def test_async_config_loader_supports_plan_style_and_current_layout(tmp_path: Path) -> None:
+def test_async_config_loader_supports_plan_style_and_current_layout(
+    tmp_path: Path,
+) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         """
@@ -44,7 +46,9 @@ def test_encrypted_api_key_round_trip(tmp_path: Path) -> None:
     master_key = Fernet.generate_key()
     vault_path = tmp_path / "keys.enc"
 
-    save_api_keys(vault_path, master_key, {"providers": {"openai": {"api_key": "secret"}}})
+    save_api_keys(
+        vault_path, master_key, {"providers": {"openai": {"api_key": "secret"}}}
+    )
     payload = load_api_keys(vault_path, master_key)
 
     assert payload["providers"]["openai"]["api_key"] == "secret"

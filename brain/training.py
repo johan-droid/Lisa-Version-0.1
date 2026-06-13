@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -50,7 +49,9 @@ def _example_vector(text: str, dims: int, seed: int) -> np.ndarray:
     tokens = tokenize(text)
     if not tokens:
         return np.zeros(dims, dtype=np.float32)
-    vectors = np.stack([_token_embedding(token, dims, seed) for token in tokens], axis=0)
+    vectors = np.stack(
+        [_token_embedding(token, dims, seed) for token in tokens], axis=0
+    )
     return vectors.mean(axis=0).astype(np.float32)
 
 
@@ -62,7 +63,9 @@ def train_persona_tensor(
     seed: int = 42,
 ) -> np.ndarray:
     rng = np.random.default_rng(seed)
-    persona_vectors: dict[str, list[np.ndarray]] = {persona.value: [] for persona in Persona}
+    persona_vectors: dict[str, list[np.ndarray]] = {
+        persona.value: [] for persona in Persona
+    }
     persona_bias: dict[str, np.ndarray] = {}
 
     for persona, keywords in PERSONA_KEYWORDS.items():
@@ -74,7 +77,9 @@ def train_persona_tensor(
         vector = _example_vector(example.text, dims, seed)
         if isinstance(target, dict):
             for name, weight in target.items():
-                persona_vectors.setdefault(name, []).extend([vector * float(weight)] * max(1, int(round(weight * 4))))
+                persona_vectors.setdefault(name, []).extend(
+                    [vector * float(weight)] * max(1, int(round(weight * 4)))
+                )
         else:
             persona_vectors.setdefault(str(target), []).append(vector)
 
@@ -122,7 +127,11 @@ def _expand_examples_for_classifier(examples: list[Any]) -> tuple[list[str], lis
     for example in examples:
         target = example.target
         if isinstance(target, dict):
-            weights = {name: float(value) for name, value in target.items() if float(value) > 0.0}
+            weights = {
+                name: float(value)
+                for name, value in target.items()
+                if float(value) > 0.0
+            }
             total = sum(weights.values()) or 1.0
             for persona, weight in weights.items():
                 repeats = max(1, int(round((weight / total) * 6)))

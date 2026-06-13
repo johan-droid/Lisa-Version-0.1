@@ -20,7 +20,6 @@ from utils.env_check import check_environment
 from utils.observability import configure_sentry
 from utils.logger import configure_logging
 
-
 LOGGER = logging.getLogger("lisa.startup")
 
 try:
@@ -41,7 +40,9 @@ def apply_memory_limit(limit_bytes: int = 1_000_000_000) -> None:
     """Best-effort address-space cap for Unix-like runtimes."""
 
     if resource is None:
-        LOGGER.info("Skipping RLIMIT_AS cap because the resource module is unavailable.")
+        LOGGER.info(
+            "Skipping RLIMIT_AS cap because the resource module is unavailable."
+        )
         return
 
     try:
@@ -90,17 +91,28 @@ def _collect_settings_payload(raw: dict[str, Any]) -> dict[str, Any]:
         payload["workspace_root"] = raw["workspace_root"]
     if "model_path" in raw:
         payload["local_model_path"] = raw["model_path"]
-    for key in ("constitution_restricted", "constitution_unrestricted", "interface_keys", "max_concurrent_arms"):
+    for key in (
+        "constitution_restricted",
+        "constitution_unrestricted",
+        "interface_keys",
+        "max_concurrent_arms",
+    ):
         if key in raw:
             payload[key] = raw[key]
 
     for key in (
         "app_name",
+        "agent_id",
         "workspace_root",
         "model_path",
         "local_model_path",
         "db_path",
+        "redis_url",
+        "postgres_dsn",
+        "chroma_persist_dir",
+        "working_memory_ttl_seconds",
         "skills_dir",
+        "evolution_artifacts_dir",
         "persona_vectors_path",
         "gating_model_path",
         "local_model_path",
@@ -108,6 +120,7 @@ def _collect_settings_payload(raw: dict[str, Any]) -> dict[str, Any]:
         "local_model_n_threads",
         "local_model_n_gpu_layers",
         "docker_image",
+        "allow_local_terminal_fallback",
         "freellmapi_base_url",
         "freellmapi_api_key",
         "freellmapi_default_provider",
@@ -115,7 +128,9 @@ def _collect_settings_payload(raw: dict[str, Any]) -> dict[str, Any]:
         "message_hub_enabled",
         "message_hub_host",
         "message_hub_port",
+        "message_hub_start_listener",
         "evolution_enabled",
+        "autonomous_enabled",
         "evolution_check_interval_seconds",
         "evolution_window_start_hour",
         "evolution_window_duration_hours",
@@ -126,12 +141,23 @@ def _collect_settings_payload(raw: dict[str, Any]) -> dict[str, Any]:
         "evolution_staging_dir",
         "incoming_queue_size",
         "tool_timeout_seconds",
+        "hybrid_brain_enabled",
+        "hybrid_brain_stress_threshold",
+        "hybrid_brain_prompt_chars_threshold",
+        "hybrid_brain_race_window_ms",
+        "evolution_skill_autoload_limit",
         "model_provider",
         "model_name",
         "model_base_url",
         "model_api_key",
         "external_timeout_seconds",
         "enable_browser_tools",
+        "admin_api_token",
+        "enable_unsafe_admin_endpoints",
+        "enable_legacy_bot_pairing",
+        "telegram_allowed_user_ids",
+        "slack_allowed_user_ids",
+        "whatsapp_allowed_user_ids",
         "max_concurrent_arms",
         "freellmapi_requests_per_minute",
         "freellmapi_tokens_per_minute",
@@ -218,9 +244,18 @@ def parse_args() -> argparse.Namespace:
     default_host = _default_bind_host()
     default_port = _default_bind_port()
     parser = argparse.ArgumentParser(description="Start the LISA agent stack.")
-    parser.add_argument("--config", default="config.yaml", help="Path to the YAML bootstrap config.")
-    parser.add_argument("--host", default=default_host, help="Host for the FastAPI control plane.")
-    parser.add_argument("--port", type=int, default=default_port, help="Port for the FastAPI control plane.")
+    parser.add_argument(
+        "--config", default="config.yaml", help="Path to the YAML bootstrap config."
+    )
+    parser.add_argument(
+        "--host", default=default_host, help="Host for the FastAPI control plane."
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=default_port,
+        help="Port for the FastAPI control plane.",
+    )
     parser.add_argument(
         "--reload",
         action="store_true",
@@ -240,7 +275,10 @@ def _default_bind_host() -> str:
     if env_host:
         return env_host
 
-    if any(os.environ.get(name) for name in ("PORT", "RENDER", "DYNO", "RAILWAY_ENVIRONMENT")):
+    if any(
+        os.environ.get(name)
+        for name in ("PORT", "RENDER", "DYNO", "RAILWAY_ENVIRONMENT")
+    ):
         return "0.0.0.0"
 
     return "127.0.0.1"
@@ -252,12 +290,18 @@ def _default_bind_port() -> int:
         try:
             return int(raw_port)
         except ValueError:
-            LOGGER.warning("Ignoring invalid PORT value %r; falling back to 8000", raw_port)
+            LOGGER.warning(
+                "Ignoring invalid PORT value %r; falling back to 8000", raw_port
+            )
     return 8000
 
 
 def _print_banner(settings: Settings, bootstrap: BootstrapConfig) -> None:
-    hub = f"{settings.message_hub_host}:{settings.message_hub_port}" if settings.message_hub_enabled else "disabled"
+    hub = (
+        f"{settings.message_hub_host}:{settings.message_hub_port}"
+        if settings.message_hub_enabled
+        else "disabled"
+    )
     banner_lines = [
         "LISA boot sequence complete.",
         f"  config: {bootstrap.path}",
@@ -266,8 +310,9 @@ def _print_banner(settings: Settings, bootstrap: BootstrapConfig) -> None:
         f"  message hub: {hub}",
         f"  evolution: {'enabled' if settings.evolution_enabled else 'disabled'}",
     ]
-    if settings.bot_security_key:
-        banner_lines.append(f"  bot security key: {settings.bot_security_key}")
+    banner_lines.append(
+        f"  admin api: {'configured' if settings.admin_api_token else 'not configured'}"
+    )
     print("\n".join(banner_lines))
 
 
@@ -276,37 +321,29 @@ def main() -> None:
     apply_memory_limit()
     config_path = Path(args.config).resolve()
     settings, bootstrap = load_bootstrap_config(config_path)
-    if not settings.bot_security_key:
-        import secrets
-        generated_key = secrets.token_hex(32)
-        settings.bot_security_key = generated_key
-        env_local_path = settings.workspace_root / ".env.local"
-        try:
-            if env_local_path.exists():
-                content = env_local_path.read_text(encoding="utf-8")
-                if "LISA_BOT_SECURITY_KEY" not in content:
-                    if content and not content.endswith("\n"):
-                        content += "\n"
-                    content += f"LISA_BOT_SECURITY_KEY={generated_key}\n"
-                    env_local_path.write_text(content, encoding="utf-8")
-            else:
-                env_local_path.write_text(f"LISA_BOT_SECURITY_KEY={generated_key}\n", encoding="utf-8")
-            LOGGER.info("Generated a secure random LISA_BOT_SECURITY_KEY and appended to .env.local")
-        except Exception as exc:
-            LOGGER.warning("Could not write generated security key to .env.local: %s", exc)
     key_vault_path = settings.workspace_root / "keys.enc"
-    master_key = os.environ.get("LISA_MASTER_KEY") or os.environ.get("LISA_KEYS_MASTER_KEY")
+    master_key = os.environ.get("LISA_MASTER_KEY") or os.environ.get(
+        "LISA_KEYS_MASTER_KEY"
+    )
     if master_key and key_vault_path.exists():
         try:
             encrypted_payload = load_api_keys(key_vault_path, master_key)
             interface_keys = dict(encrypted_payload.get("interface_keys") or {})
             if interface_keys:
-                settings.interface_keys.update({str(key): str(value) for key, value in interface_keys.items()})
+                settings.interface_keys.update(
+                    {str(key): str(value) for key, value in interface_keys.items()}
+                )
             LOGGER.info("Loaded encrypted key vault from %s", key_vault_path)
         except Exception as exc:
-            LOGGER.warning("Unable to load encrypted key vault %s: %s", key_vault_path, exc)
+            LOGGER.warning(
+                "Unable to load encrypted key vault %s: %s", key_vault_path, exc
+            )
     logger = configure_logging(settings.log_file, args.log_level)
     logger.info("Bootstrap config loaded from %s", config_path)
+    if settings.bot_security_key:
+        logger.warning(
+            "LISA_BOT_SECURITY_KEY is deprecated and ignored by the current channel access model."
+        )
     configure_sentry(settings, logger=logger)
     env_result = check_environment(settings, bootstrap)
     for warning in env_result.warnings:
@@ -322,9 +359,10 @@ def main() -> None:
 
 
 async def _serve(app, host: str, port: int, reload: bool, log_level: str) -> None:
-    config = uvicorn.Config(app, host=host, port=port, reload=reload, log_level=log_level)
+    config = uvicorn.Config(
+        app, host=host, port=port, reload=reload, log_level=log_level
+    )
     server = uvicorn.Server(config)
-    loop = asyncio.get_running_loop()
 
     def _request_shutdown() -> None:
         server.should_exit = True
@@ -342,5 +380,7 @@ async def _serve(app, host: str, port: int, reload: bool, log_level: str) -> Non
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     main()

@@ -69,8 +69,12 @@ def infer_persona_blend(message: str) -> dict[str, float]:
                 scores[persona] += 0.8
 
     total = sum(scores.values())
-    normalized = {persona.value: round(score / total, 3) for persona, score in scores.items()}
+    normalized = {
+        persona.value: round(score / total, 3) for persona, score in scores.items()
+    }
 
     remainder = 1.0 - sum(normalized.values())
-    normalized[Persona.ARCHITECT.value] = round(normalized[Persona.ARCHITECT.value] + remainder, 3)
+    normalized[Persona.ARCHITECT.value] = round(
+        normalized[Persona.ARCHITECT.value] + remainder, 3
+    )
     return normalized

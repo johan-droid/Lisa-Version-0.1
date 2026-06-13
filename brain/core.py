@@ -11,7 +11,10 @@ import numpy as np
 from brain.parser import FunctionCallParser
 from lisa.constitutions import ConstitutionMode
 from lisa.gating import PersonaGatingNetwork
-from lisa.local_inference import LocalGenerationRequest, PersonaGatedModel as LocalBrainModel
+from lisa.local_inference import (
+    LocalGenerationRequest,
+    PersonaGatedModel as LocalBrainModel,
+)
 from lisa.personas import Persona, infer_persona_blend
 from lisa.soft_prompts import PersonaSoftPromptBank, load_persona_tensor_artifact
 
@@ -40,14 +43,20 @@ def _list_to_weight_map(weights: Sequence[float]) -> dict[str, float]:
 
 
 def _blend_digest(weights: dict[str, float], tensor: np.ndarray) -> str:
-    payload = np.asarray(tensor, dtype=np.float32).tobytes() + repr(sorted(weights.items())).encode("utf-8")
+    payload = np.asarray(tensor, dtype=np.float32).tobytes() + repr(
+        sorted(weights.items())
+    ).encode("utf-8")
     digest = hashlib.sha256(payload).digest()
     symbols = "⟡⟢⟣⟤⟥⟦⟧⟨⟩◈◉◌◍◎○●"
     return "".join(symbols[byte % len(symbols)] for byte in digest[:12])
 
 
 def _constitution_prompt(constitution: str) -> str:
-    mode = constitution.strip().lower() if constitution else ConstitutionMode.RESTRICTED.value
+    mode = (
+        constitution.strip().lower()
+        if constitution
+        else ConstitutionMode.RESTRICTED.value
+    )
     if mode == ConstitutionMode.UNRESTRICTED.value:
         return (
             "You are LISA in unrestricted lab mode. "
@@ -132,7 +141,9 @@ class PersonaGatedModel:
     def _load_persona_bank(path: Path) -> PersonaSoftPromptBank:
         if path.exists():
             if path.suffix == ".pt":
-                return PersonaSoftPromptBank.from_tensor(load_persona_tensor_artifact(path))
+                return PersonaSoftPromptBank.from_tensor(
+                    load_persona_tensor_artifact(path)
+                )
             return PersonaSoftPromptBank.load(path)
         bank = PersonaSoftPromptBank.initialize()
         bank.save(path)
@@ -146,7 +157,9 @@ class PersonaGatedModel:
                 return dict(self.gating_model.predict_blend(message))
         return infer_persona_blend(message)
 
-    def _coerce_blend(self, persona_blend: Sequence[float] | dict[str, float] | None, message: str) -> dict[str, float]:
+    def _coerce_blend(
+        self, persona_blend: Sequence[float] | dict[str, float] | None, message: str
+    ) -> dict[str, float]:
         if persona_blend is None:
             return self.compute_blend(message)
         if isinstance(persona_blend, dict):

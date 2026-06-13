@@ -4,11 +4,13 @@ import asyncio
 import json
 import importlib.util
 import inspect
+import hashlib
 import os
 import re
 import shlex
 import shutil
 import textwrap
+import time
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -26,7 +28,18 @@ from lisa.constitutions import ConstitutionMode
 from lisa.events import EventBus, LisaEvent
 from lisa.llm import LLMClient
 from lisa.notepad import AsyncNotepadWriter, Notepad
-
+from safety.input_sanitizer import (
+    inspect_query_text,
+    sanitize_structure,
+    sanitize_text,
+    sanitize_user_visible_text,
+)
+from utils.secure_artifacts import (
+    artifact_url_to_path,
+    build_local_artifact_url,
+    decrypt_artifact_url,
+    encrypt_artifact_url,
+)
 
 ToolHandler = Callable[[dict[str, Any], "ToolContext"], Awaitable[Any]]
 
@@ -49,6 +62,9 @@ class ToolContext:
     notepad_writer: AsyncNotepadWriter
     session_id: str | None = None
     trace_id: str | None = None
+    task_id: str | None = None
+    idempotency_key: str | None = None
+    workspace_root: Path | None = None
 
 
 class ToolRegistry:
@@ -72,18 +88,50 @@ class ToolRegistry:
         self._mcp_lock = asyncio.Lock()
         self._skills_manifest_path = self.settings.skills_dir / "skills_manifest.json"
         self._skills_archive_dir = self.settings.skills_dir / "archive"
+        self._artifact_skill_failures: dict[str, list[float]] = {}
         self._register_defaults()
-        self._load_manifest_skills()
+        self._core_tool_names = set(self._tools)
+        self.reload_manifest_skills()
 
     def list_tools(self) -> list[ToolSpec]:
         return sorted(self._tools.values(), key=lambda tool: tool.name)
 
-    def register_tool(self, spec_or_name: ToolSpec | str, handler: ToolHandler | None = None, *, description: str = "", restricted_safe: bool = False) -> None:
+    async def preload_relevant_skills(
+        self, query: str, limit: int = 2
+    ) -> list[dict[str, Any]]:
+        matches = await asyncio.to_thread(
+            self.notepad.search_evolution_skill_artifacts, query, limit
+        )
+        loaded: list[dict[str, Any]] = []
+        for record in matches:
+            skill_name = str(record.get("skill_name") or "").strip()
+            if not skill_name:
+                continue
+            try:
+                loaded_record = await asyncio.to_thread(
+                    self.ensure_dynamic_skill_loaded, skill_name
+                )
+            except Exception:
+                continue
+            if loaded_record is not None:
+                loaded.append(loaded_record)
+        return loaded
+
+    def register_tool(
+        self,
+        spec_or_name: ToolSpec | str,
+        handler: ToolHandler | None = None,
+        *,
+        description: str = "",
+        restricted_safe: bool = False,
+    ) -> None:
         if isinstance(spec_or_name, ToolSpec):
             self._register(spec_or_name)
             return
         if handler is None:
-            raise ValueError("register_tool requires a handler when no ToolSpec is supplied.")
+            raise ValueError(
+                "register_tool requires a handler when no ToolSpec is supplied."
+            )
         self._register(
             ToolSpec(
                 name=spec_or_name,
@@ -100,10 +148,18 @@ class ToolRegistry:
         constitution: ConstitutionMode,
         session_id: str | None = None,
         trace_id: str | None = None,
+        task_id: str | None = None,
+        idempotency_key: str | None = None,
+        workspace_root_override: Path | None = None,
     ) -> Any:
         spec = self._tools.get(name)
         if spec is None:
-            raise KeyError(f"Unknown tool: {name}")
+            loaded = await asyncio.to_thread(self.ensure_dynamic_skill_loaded, name)
+            if loaded is None:
+                raise KeyError(f"Unknown tool: {name}")
+            spec = self._tools.get(name)
+            if spec is None:
+                raise KeyError(f"Unknown tool: {name}")
 
         context = ToolContext(
             settings=self.settings,
@@ -114,6 +170,9 @@ class ToolRegistry:
             notepad_writer=self.notepad_writer,
             session_id=session_id,
             trace_id=trace_id,
+            task_id=task_id,
+            idempotency_key=idempotency_key,
+            workspace_root=workspace_root_override,
         )
         last_error: Exception | None = None
         attempts = 2
@@ -132,6 +191,8 @@ class ToolRegistry:
                         "attempt": attempt,
                         "session_id": session_id,
                         "trace_id": trace_id,
+                        "task_id": task_id,
+                        "idempotency_key": idempotency_key,
                     },
                     constitution=constitution,
                 )
@@ -145,6 +206,8 @@ class ToolRegistry:
                             "attempt": attempt,
                             "session_id": session_id,
                             "trace_id": trace_id,
+                            "task_id": task_id,
+                            "idempotency_key": idempotency_key,
                         },
                     )
                 )
@@ -160,6 +223,8 @@ class ToolRegistry:
                         "attempt": attempt,
                         "session_id": session_id,
                         "trace_id": trace_id,
+                        "task_id": task_id,
+                        "idempotency_key": idempotency_key,
                     },
                     constitution=constitution,
                 )
@@ -172,33 +237,61 @@ class ToolRegistry:
                             "attempt": attempt,
                             "session_id": session_id,
                             "trace_id": trace_id,
+                            "task_id": task_id,
+                            "idempotency_key": idempotency_key,
                         },
                     )
                 )
                 if attempt < attempts:
                     continue
-                
+
                 # Check if this is an evolved skill and track its error
                 CORE_TOOLS = {
-                    "search_notepad", "dashboard_update", "file_read", "file_write",
-                    "file_edit", "terminal_exec", "call_external_llm", "add_skill",
-                    "rollback_skill", "mcp_call", "browser_fetch", "browser_search"
+                    "search_notepad",
+                    "dashboard_update",
+                    "file_read",
+                    "file_write",
+                    "file_edit",
+                    "terminal_exec",
+                    "call_external_llm",
+                    "add_skill",
+                    "rollback_skill",
+                    "mcp_call",
+                    "browser_fetch",
+                    "browser_search",
                 }
                 if name not in CORE_TOOLS:
                     import logging
+
                     logger = logging.getLogger("lisa.tools")
+                    artifact_record = await asyncio.to_thread(
+                        self.notepad.get_evolution_skill_artifact, name
+                    )
+                    if artifact_record is not None:
+                        disabled = await asyncio.to_thread(
+                            self._track_artifact_skill_error, name, str(exc)
+                        )
+                        if disabled:
+                            logger.warning(
+                                "Disabled artifact skill '%s' after repeated failures.",
+                                name,
+                            )
+                        break
                     from utils.evolution_guard import track_skill_error
+
                     rolled_back = await asyncio.to_thread(
                         track_skill_error,
                         name,
                         str(exc),
                         self.settings.skills_dir,
-                        self.settings.backup_dir
+                        self.settings.backup_dir,
                     )
                     if rolled_back:
-                        logger.warning(f"Auto-rollback triggered for skill '{name}' due to high error rate. Reloading manifest skills.")
-                        self._load_manifest_skills()
-                
+                        logger.warning(
+                            f"Auto-rollback triggered for skill '{name}' due to high error rate. Reloading manifest skills."
+                        )
+                        self.reload_manifest_skills()
+
                 break
 
         assert last_error is not None
@@ -306,23 +399,29 @@ class ToolRegistry:
                 )
             )
 
-    def _resolve_workspace_path(self, raw_path: str) -> Path:
+    def _resolve_workspace_path(
+        self, raw_path: str, workspace_root: Path | None = None
+    ) -> Path:
+        root = workspace_root or self.settings.workspace_root
         candidate = Path(raw_path)
         if not candidate.is_absolute():
-            candidate = (self.settings.workspace_root / candidate).resolve()
+            candidate = (root / candidate).resolve()
         else:
             candidate = candidate.resolve()
 
         try:
-            candidate.relative_to(self.settings.workspace_root)
+            candidate.relative_to(root)
         except ValueError as exc:
             raise ValueError("Path must stay inside the configured workspace.") from exc
 
         return candidate
 
-    def _ensure_restricted_safe_command(self, command: str, constitution: ConstitutionMode) -> None:
+    def _ensure_restricted_safe_command(
+        self, command: str, constitution: ConstitutionMode
+    ) -> None:
         if constitution == ConstitutionMode.UNRESTRICTED:
             return
+        command = sanitize_text(command, max_length=2_000)
 
         patterns = (
             r"\brm\s+-rf\b",
@@ -342,14 +441,32 @@ class ToolRegistry:
                     "Restricted mode blocked a potentially destructive shell command."
                 )
 
-    async def _search_notepad(self, arguments: dict[str, Any], context: ToolContext) -> Any:
-        query = str(arguments.get("query", "")).strip()
+    async def _search_notepad(
+        self, arguments: dict[str, Any], context: ToolContext
+    ) -> Any:
+        query = sanitize_text(str(arguments.get("query", "")), max_length=256)
         limit = int(arguments.get("limit", 10))
         if not query:
             raise ValueError("search_notepad requires a non-empty 'query'.")
+        inspection = inspect_query_text(query)
+        if inspection.suspicious:
+            await context.event_bus.publish(
+                LisaEvent(
+                    type="security.query_flagged",
+                    payload={
+                        "query": query,
+                        "reasons": inspection.reasons,
+                        "task_id": context.task_id,
+                    },
+                    session_id=context.session_id,
+                    trace_id=context.trace_id,
+                )
+            )
         return await asyncio.to_thread(context.notepad.search, query, limit)
 
-    async def _dashboard_update(self, arguments: dict[str, Any], context: ToolContext) -> Any:
+    async def _dashboard_update(
+        self, arguments: dict[str, Any], context: ToolContext
+    ) -> Any:
         metric = str(arguments.get("metric", "")).strip()
         value = str(arguments.get("value", "")).strip()
         if not metric or not value:
@@ -369,21 +486,30 @@ class ToolRegistry:
         return {"status": "ok", "metric": metric, "value": value}
 
     async def _file_read(self, arguments: dict[str, Any], context: ToolContext) -> Any:
-        path = self._resolve_workspace_path(str(arguments.get("path", "")))
+        path = self._resolve_workspace_path(
+            str(arguments.get("path", "")), context.workspace_root
+        )
         content = await asyncio.to_thread(path.read_text, encoding="utf-8")
-        return {"path": str(path), "content": content}
+        return {
+            "path": str(path),
+            "content": sanitize_user_visible_text(content, max_length=12_000),
+        }
 
     async def _file_write(self, arguments: dict[str, Any], context: ToolContext) -> Any:
-        path = self._resolve_workspace_path(str(arguments.get("path", "")))
-        content = str(arguments.get("content", ""))
+        path = self._resolve_workspace_path(
+            str(arguments.get("path", "")), context.workspace_root
+        )
+        content = sanitize_text(str(arguments.get("content", "")), max_length=100_000)
         await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread(path.write_text, content, encoding="utf-8")
         return {"path": str(path), "bytes_written": len(content.encode("utf-8"))}
 
     async def _file_edit(self, arguments: dict[str, Any], context: ToolContext) -> Any:
-        path = self._resolve_workspace_path(str(arguments.get("path", "")))
-        find = str(arguments.get("find", ""))
-        replace = str(arguments.get("replace", ""))
+        path = self._resolve_workspace_path(
+            str(arguments.get("path", "")), context.workspace_root
+        )
+        find = sanitize_text(str(arguments.get("find", "")), max_length=8_000)
+        replace = sanitize_text(str(arguments.get("replace", "")), max_length=32_000)
         if not find:
             raise ValueError("file_edit requires a non-empty 'find' string.")
 
@@ -395,45 +521,83 @@ class ToolRegistry:
         await asyncio.to_thread(path.write_text, updated, encoding="utf-8")
         return {"path": str(path), "replacements": occurrences}
 
-    async def _terminal_exec(self, arguments: dict[str, Any], context: ToolContext) -> Any:
-        command = str(arguments.get("command", "")).strip()
+    async def _terminal_exec(
+        self, arguments: dict[str, Any], context: ToolContext
+    ) -> Any:
+        command = sanitize_text(str(arguments.get("command", "")), max_length=2_000)
         timeout = int(arguments.get("timeout", 30))
         if not command:
             raise ValueError("terminal_exec requires a non-empty 'command'.")
 
         self._ensure_restricted_safe_command(command, context.constitution)
 
-        if shutil.which("docker") is None:
-            raise RuntimeError("Docker is not available on this machine.")
+        mode = os.environ.get("LISA_TOOL_EXEC_MODE", "hybrid").lower()
+        has_docker = shutil.which("docker") is not None
 
-        process = await asyncio.create_subprocess_exec(
-            "docker",
-            "run",
-            "--rm",
-            "-i",
-            "--network",
-            "none",
-            "--cpus",
-            "1",
-            "--memory",
-            "512m",
-            "--pids-limit",
-            "128",
-            "--mount",
-            f"type=bind,source={self.settings.workspace_root.as_posix()},target=/workspace",
-            "-w",
-            "/workspace",
-            "-e",
-            "HOME=/tmp",
-            self.settings.docker_image,
-            "sh",
-            "-lc",
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        use_docker = False
+        if mode == "docker":
+            if not has_docker:
+                raise RuntimeError(
+                    "Docker is not available on this machine (required by LISA_TOOL_EXEC_MODE=docker)."
+                )
+            use_docker = True
+        elif mode == "hybrid":
+            if has_docker:
+                use_docker = True
+            elif not context.settings.allow_local_terminal_fallback:
+                raise RuntimeError(
+                    "Docker is unavailable and local terminal fallback is disabled. "
+                    "Enable LISA_ALLOW_LOCAL_TERMINAL_FALLBACK=true only for trusted local development."
+                )
+        elif mode == "local":
+            use_docker = False
+        else:
+            if has_docker:
+                use_docker = True
+            elif not context.settings.allow_local_terminal_fallback:
+                raise RuntimeError(
+                    "Docker is unavailable and local terminal fallback is disabled. "
+                    "Set LISA_TOOL_EXEC_MODE=local or enable LISA_ALLOW_LOCAL_TERMINAL_FALLBACK=true to override."
+                )
+
+        if use_docker:
+            process = await asyncio.create_subprocess_exec(
+                "docker",
+                "run",
+                "--rm",
+                "-i",
+                "--network",
+                "none",
+                "--cpus",
+                "1",
+                "--memory",
+                "512m",
+                "--pids-limit",
+                "128",
+                "--mount",
+                f"type=bind,source={(context.workspace_root or self.settings.workspace_root).as_posix()},target=/workspace",
+                "-w",
+                "/workspace",
+                "-e",
+                "HOME=/tmp",
+                self.settings.docker_image,
+                "sh",
+                "-lc",
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=context.workspace_root or self.settings.workspace_root,
+            )
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=timeout
+            )
         except TimeoutError:
             process.kill()
             await process.communicate()
@@ -445,13 +609,21 @@ class ToolRegistry:
             "stderr": stderr.decode("utf-8", errors="replace"),
         }
 
-    async def _call_external_llm(self, arguments: dict[str, Any], context: ToolContext) -> Any:
+    async def _call_external_llm(
+        self, arguments: dict[str, Any], context: ToolContext
+    ) -> Any:
         provider = str(arguments.get("provider", "")).strip()
         model = str(arguments.get("model", "")).strip() or None
         prompt = str(arguments.get("prompt", "")).strip()
         system_prompt = str(arguments.get("system_prompt", "")).strip() or None
         max_tokens = int(arguments.get("max_tokens", 800))
-        if provider and context.settings.model_provider and provider != context.settings.model_provider:
+        configured_provider = str(context.settings.model_provider or "").strip()
+        if (
+            provider
+            and configured_provider
+            and configured_provider not in {"", "local"}
+            and provider != configured_provider
+        ):
             raise ValueError(
                 f"Configured provider is '{context.settings.model_provider}', got '{provider}'."
             )
@@ -463,7 +635,8 @@ class ToolRegistry:
             prompt=prompt,
             max_tokens=max_tokens,
             model=model,
-            system_prompt=system_prompt or "You are LISA's external reasoning coprocessor.",
+            system_prompt=system_prompt
+            or "You are LISA's external reasoning coprocessor.",
         )
         await asyncio.to_thread(
             context.notepad.add_metric,
@@ -493,26 +666,28 @@ class ToolRegistry:
         name = str(arguments.get("name", "")).strip()
         code = str(arguments.get("code", "")).strip()
         body = str(arguments.get("body", "")).strip()
+        storage = (
+            str(
+                arguments.get("storage")
+                or arguments.get("persist_strategy")
+                or "manifest"
+            )
+            .strip()
+            .lower()
+        )
+        description = str(arguments.get("description") or "").strip()
+        raw_keywords = arguments.get("keywords") or []
+        metadata = (
+            arguments.get("metadata")
+            if isinstance(arguments.get("metadata"), dict)
+            else {}
+        )
         if not name:
             raise ValueError("add_skill requires a non-empty 'name'.")
         if not code and not body:
             raise ValueError("add_skill requires 'code' or 'body'.")
 
         slug = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or "skill"
-        path = context.settings.skills_dir / f"{slug}.py"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Take a snapshot of skills directory before modifying
-        from utils.evolution_guard import snapshot_skills_dir, record_skill_deployment
-        snapshot_path = await asyncio.to_thread(
-            snapshot_skills_dir,
-            context.settings.skills_dir,
-            context.settings.backup_dir
-        )
-
-        archive_path = None
-        if path.exists():
-            archive_path = await asyncio.to_thread(self._archive_skill_version, slug, path)
         if not code:
             function_name = slug
             code = f"def {function_name}(context):\n{textwrap.indent(body or 'pass', '    ')}\n"
@@ -520,17 +695,64 @@ class ToolRegistry:
             function_name = slug
             code = f"def {function_name}(context):\n{textwrap.indent(code or 'pass', '    ')}\n"
         compile(code, f"<skill:{slug}>", "exec")
+
+        if storage == "artifact":
+            keywords = self._normalize_skill_keywords(
+                raw_keywords, description=description, name=name, metadata=metadata
+            )
+            record = await asyncio.to_thread(
+                self._store_skill_artifact,
+                slug,
+                name,
+                code,
+                description or f"Artifact-backed evolution skill for {name}.",
+                keywords,
+                metadata,
+            )
+            self._load_evolution_skill_record(record)
+            return {
+                "path": record["artifact_path"],
+                "status": "artifact_saved",
+                "artifact_ref": record["artifact_ref"],
+                "version": record["version"],
+                "description": record["description"],
+                "keywords": record["keywords"],
+            }
+
+        path = context.settings.skills_dir / f"{slug}.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Take a snapshot of skills directory before modifying
+        from utils.evolution_guard import snapshot_skills_dir, record_skill_deployment
+
+        snapshot_path = await asyncio.to_thread(
+            snapshot_skills_dir,
+            context.settings.skills_dir,
+            context.settings.backup_dir,
+        )
+
+        archive_path = None
+        if path.exists():
+            archive_path = await asyncio.to_thread(
+                self._archive_skill_version, slug, path
+            )
         await asyncio.to_thread(path.write_text, code, encoding="utf-8")
-        
+
         # Record skill deployment in the journal
         record_skill_deployment(slug, path, snapshot_path, context.settings.backup_dir)
 
         module = self._import_skill_module(slug, path)
         export_name = self._find_skill_export(module, slug)
         if export_name is None:
-            raise ValueError("Skill modules must define a callable named 'skill' or matching the skill slug.")
-        self.register_tool(slug, self._build_skill_wrapper(slug, getattr(module, export_name)))
-        await asyncio.to_thread(self._update_skill_manifest, slug, name, path, archive_path)
+            raise ValueError(
+                "Skill modules must define a callable named 'skill' or matching the skill slug."
+            )
+        self.register_tool(
+            slug, self._build_skill_wrapper(slug, getattr(module, export_name))
+        )
+        await asyncio.to_thread(
+            self._update_skill_manifest, slug, name, path, archive_path
+        )
         return {
             "path": str(path),
             "status": "saved",
@@ -538,12 +760,30 @@ class ToolRegistry:
             "version": self._skill_version_count(slug),
         }
 
-    async def _rollback_skill(self, arguments: dict[str, Any], context: ToolContext) -> Any:
+    async def _rollback_skill(
+        self, arguments: dict[str, Any], context: ToolContext
+    ) -> Any:
         name = str(arguments.get("name", "")).strip()
         version = str(arguments.get("version", "")).strip()
         if not name:
             raise ValueError("rollback_skill requires a non-empty 'name'.")
         slug = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or "skill"
+        artifact_record = await asyncio.to_thread(
+            self.notepad.get_evolution_skill_artifact, slug
+        )
+        if artifact_record is not None:
+            await asyncio.to_thread(
+                self.notepad.disable_evolution_skill,
+                slug,
+                f"Rollback requested for artifact skill version '{version or 'latest'}'.",
+            )
+            self._tools.pop(slug, None)
+            return {
+                "status": "rolled_back",
+                "path": None,
+                "restored_from": None,
+                "storage": "artifact",
+            }
         restored = await asyncio.to_thread(self._restore_skill_version, slug, version)
         return {"status": "rolled_back", **restored}
 
@@ -567,12 +807,16 @@ class ToolRegistry:
             command=command_parts,
             method=method,
             params=params if isinstance(params, dict) else {"value": params},
-            timeout=int(arguments.get("timeout", context.settings.tool_timeout_seconds)),
+            timeout=int(
+                arguments.get("timeout", context.settings.tool_timeout_seconds)
+            ),
         )
         return result
 
-    async def _browser_fetch(self, arguments: dict[str, Any], context: ToolContext) -> Any:
-        url = str(arguments.get("url", "")).strip()
+    async def _browser_fetch(
+        self, arguments: dict[str, Any], context: ToolContext
+    ) -> Any:
+        url = sanitize_text(str(arguments.get("url", "")), max_length=2_000)
         extract_text = bool(arguments.get("extract_text", True))
         if not url:
             raise ValueError("browser_fetch requires a non-empty 'url'.")
@@ -584,7 +828,9 @@ class ToolRegistry:
                 self._web_cache[url] = html
 
         if html is None:
-            async with httpx.AsyncClient(timeout=context.settings.external_timeout_seconds) as client:
+            async with httpx.AsyncClient(
+                timeout=context.settings.external_timeout_seconds
+            ) as client:
                 response = await client.get(url, follow_redirects=True)
                 response.raise_for_status()
                 html = response.text
@@ -593,18 +839,41 @@ class ToolRegistry:
                 while len(self._web_cache) > 32:
                     self._web_cache.popitem(last=False)
 
-        result: dict[str, Any] = {"url": url, "html": html}
+        result: dict[str, Any] = {
+            "url": url,
+            "html": sanitize_user_visible_text(html, max_length=16_000),
+        }
         if extract_text:
-            result["text"] = self._html_to_text(html)
+            result["text"] = sanitize_user_visible_text(
+                self._html_to_text(html), max_length=12_000
+            )
         return result
 
-    async def _browser_search(self, arguments: dict[str, Any], context: ToolContext) -> Any:
-        query = str(arguments.get("query", "")).strip()
+    async def _browser_search(
+        self, arguments: dict[str, Any], context: ToolContext
+    ) -> Any:
+        query = sanitize_text(str(arguments.get("query", "")), max_length=256)
         if not query:
             raise ValueError("browser_search requires a non-empty 'query'.")
+        inspection = inspect_query_text(query)
+        if inspection.suspicious:
+            await context.event_bus.publish(
+                LisaEvent(
+                    type="security.query_flagged",
+                    payload={
+                        "query": query,
+                        "reasons": inspection.reasons,
+                        "task_id": context.task_id,
+                    },
+                    session_id=context.session_id,
+                    trace_id=context.trace_id,
+                )
+            )
 
         url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        async with httpx.AsyncClient(timeout=context.settings.external_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=context.settings.external_timeout_seconds
+        ) as client:
             response = await client.get(url, follow_redirects=True)
             response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
@@ -613,11 +882,18 @@ class ToolRegistry:
             title = link.get_text(" ", strip=True)
             href = link.get("href")
             if title and href:
-                results.append({"title": title, "url": href})
+                results.append(
+                    {
+                        "title": sanitize_user_visible_text(title, max_length=500),
+                        "url": sanitize_text(href, max_length=2_000),
+                    }
+                )
             if len(results) >= 5:
                 break
 
-        return {"query": query, "results": results}
+        return sanitize_structure(
+            {"query": query, "results": results}, max_string_length=2_000, max_items=10
+        )
 
     async def _run_mcp_call(
         self,
@@ -674,7 +950,9 @@ class ToolRegistry:
             self._mcp_servers[server_name] = handle
             return handle
 
-    async def _mcp_initialize(self, handle: "_MCPServerHandle", timeout: int) -> dict[str, Any]:
+    async def _mcp_initialize(
+        self, handle: "_MCPServerHandle", timeout: int
+    ) -> dict[str, Any]:
         if handle.initialized:
             return handle.initialize_result or {}
 
@@ -718,16 +996,24 @@ class ToolRegistry:
 
         expected_id = request.get("id")
         deadline = asyncio.get_running_loop().time() + timeout
-        stderr_task = asyncio.create_task(self._collect_stderr(handle), name=f"mcp-stderr-{handle.server_name}")
+        stderr_task = asyncio.create_task(
+            self._collect_stderr(handle), name=f"mcp-stderr-{handle.server_name}"
+        )
         try:
             while True:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
-                    raise TimeoutError(f"MCP request timed out after {timeout} seconds.")
+                    raise TimeoutError(
+                        f"MCP request timed out after {timeout} seconds."
+                    )
                 try:
-                    raw = await asyncio.wait_for(handle.process.stdout.readline(), timeout=remaining)
+                    raw = await asyncio.wait_for(
+                        handle.process.stdout.readline(), timeout=remaining
+                    )
                 except TimeoutError:
-                    raise TimeoutError(f"MCP request timed out after {timeout} seconds.")
+                    raise TimeoutError(
+                        f"MCP request timed out after {timeout} seconds."
+                    )
                 if not raw:
                     stderr_output = await self._drain_task(stderr_task)
                     raise RuntimeError(
@@ -791,12 +1077,14 @@ class ToolRegistry:
         text = soup.get_text(" ", strip=True)
         text = unescape(text)
         text = re.sub(r"\s+", " ", text)
-        return text.strip()
+        return sanitize_user_visible_text(text.strip(), max_length=12_000)
 
     def _load_manifest_skills(self) -> None:
         if not self._skills_manifest_path.exists():
             self._skills_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            self._skills_manifest_path.write_text(json.dumps({"skills": {}}, indent=2), encoding="utf-8")
+            self._skills_manifest_path.write_text(
+                json.dumps({"skills": {}}, indent=2), encoding="utf-8"
+            )
             return
 
         try:
@@ -825,7 +1113,170 @@ class ToolRegistry:
             export_name = self._find_skill_export(module, str(slug))
             if export_name is None:
                 continue
-            self.register_tool(str(slug), self._build_skill_wrapper(str(slug), getattr(module, export_name)))
+            self.register_tool(
+                str(slug),
+                self._build_skill_wrapper(str(slug), getattr(module, export_name)),
+            )
+
+    def reload_manifest_skills(self) -> None:
+        for name in list(self._tools):
+            if name not in self._core_tool_names:
+                self._tools.pop(name, None)
+        self._load_manifest_skills()
+
+    def ensure_dynamic_skill_loaded(self, skill_name: str) -> dict[str, Any] | None:
+        normalized_name = re.sub(r"[^a-z0-9_]+", "_", str(skill_name).lower()).strip(
+            "_"
+        )
+        if not normalized_name:
+            return None
+        if normalized_name in self._tools:
+            return self.notepad.get_evolution_skill_artifact(normalized_name)
+
+        record = self.notepad.get_evolution_skill_artifact(normalized_name)
+        if record is None or record.get("status") != "active":
+            return None
+        self._load_evolution_skill_record(record)
+        return record
+
+    def _store_skill_artifact(
+        self,
+        slug: str,
+        name: str,
+        code: str,
+        description: str,
+        keywords: list[str],
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        artifact_dir = self.settings.evolution_artifacts_dir / slug
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = artifact_dir / f"{version}.py"
+        artifact_path.write_text(code, encoding="utf-8")
+        try:
+            artifact_path.chmod(0o600)
+        except OSError:
+            pass
+        checksum = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        artifact_url = build_local_artifact_url(artifact_path)
+        encrypted_url = encrypt_artifact_url(artifact_url, self._artifact_secret())
+        url_hash = hashlib.sha256(artifact_url.encode("utf-8")).hexdigest()
+        stored = self.notepad.register_evolution_skill_artifact(
+            skill_name=slug,
+            description=description,
+            encrypted_url=encrypted_url,
+            url_hash=url_hash,
+            keywords=keywords,
+            checksum=checksum,
+            metadata={
+                **metadata,
+                "display_name": name,
+                "artifact_version": version,
+            },
+            status="active",
+        )
+        return {
+            **stored,
+            "artifact_path": str(artifact_path),
+            "artifact_ref": f"evolution://{slug}/{version}",
+            "version": version,
+        }
+
+    def _load_evolution_skill_record(self, record: dict[str, Any]) -> None:
+        skill_name = str(record.get("skill_name") or "").strip()
+        if not skill_name:
+            raise ValueError("Evolution skill record is missing a skill_name.")
+        encrypted_url = str(record.get("encrypted_url") or "").strip()
+        if not encrypted_url:
+            raise ValueError(
+                f"Evolution skill '{skill_name}' is missing an encrypted URL."
+            )
+        artifact_url = decrypt_artifact_url(encrypted_url, self._artifact_secret())
+        url_hash = hashlib.sha256(artifact_url.encode("utf-8")).hexdigest()
+        if url_hash != str(record.get("url_hash") or ""):
+            raise ValueError(f"URL hash mismatch for evolution skill '{skill_name}'.")
+        artifact_path = artifact_url_to_path(artifact_url)
+        if not artifact_path.exists():
+            raise FileNotFoundError(
+                f"Evolution skill artifact is missing: {artifact_path}"
+            )
+        code = artifact_path.read_text(encoding="utf-8")
+        checksum = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        expected_checksum = str(record.get("checksum") or "").strip()
+        if expected_checksum and checksum != expected_checksum:
+            raise ValueError(f"Checksum mismatch for evolution skill '{skill_name}'.")
+        module = self._import_skill_module(skill_name, artifact_path)
+        export_name = self._find_skill_export(module, skill_name)
+        if export_name is None:
+            raise ValueError(
+                f"Evolution skill '{skill_name}' does not expose a callable entry point."
+            )
+        self.register_tool(
+            skill_name,
+            self._build_skill_wrapper(skill_name, getattr(module, export_name)),
+        )
+        self.notepad.mark_evolution_skill_loaded(skill_name)
+
+    def _artifact_secret(self) -> str:
+        key_path = self.settings.evolution_artifacts_dir / ".artifact-url.key"
+        if key_path.exists():
+            return key_path.read_text(encoding="utf-8").strip()
+        seed = os.urandom(32).hex()
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        key_path.write_text(seed, encoding="utf-8")
+        try:
+            key_path.chmod(0o600)
+        except OSError:
+            pass
+        return seed
+
+    @staticmethod
+    def _normalize_skill_keywords(
+        raw_keywords: Any,
+        *,
+        description: str,
+        name: str,
+        metadata: dict[str, Any],
+    ) -> list[str]:
+        keywords: list[str] = []
+        if isinstance(raw_keywords, str):
+            keywords.extend(
+                part.strip().lower() for part in raw_keywords.split(",") if part.strip()
+            )
+        elif isinstance(raw_keywords, (list, tuple, set)):
+            keywords.extend(
+                str(part).strip().lower() for part in raw_keywords if str(part).strip()
+            )
+
+        for source in (
+            name,
+            description,
+            str(metadata.get("cluster") or ""),
+            str(metadata.get("summary") or ""),
+        ):
+            for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]{2,}", source.lower()):
+                if token not in keywords:
+                    keywords.append(token)
+
+        return keywords[:24]
+
+    def _track_artifact_skill_error(self, skill_name: str, error_message: str) -> bool:
+        now = time.time()
+        history = self._artifact_skill_failures.setdefault(skill_name, [])
+        history.append(now)
+        cutoff = now - 3600
+        self._artifact_skill_failures[skill_name] = [
+            stamp for stamp in history if stamp >= cutoff
+        ]
+        if len(self._artifact_skill_failures[skill_name]) < 3:
+            return False
+        self.notepad.disable_evolution_skill(
+            skill_name,
+            f"Disabled after repeated runtime failures: {error_message}",
+        )
+        self._tools.pop(skill_name, None)
+        self._artifact_skill_failures[skill_name] = []
+        return True
 
     def _archive_skill_version(self, slug: str, path: Path) -> Path:
         self._skills_archive_dir.mkdir(parents=True, exist_ok=True)
@@ -841,7 +1292,9 @@ class ToolRegistry:
         versions = skill_record.get("versions", [])
         return len(versions) + 1
 
-    def _update_skill_manifest(self, slug: str, name: str, path: Path, archive_path: Path | None) -> None:
+    def _update_skill_manifest(
+        self, slug: str, name: str, path: Path, archive_path: Path | None
+    ) -> None:
         manifest = self._skill_manifest()
         record = manifest.get(slug, {"name": name, "versions": []})
         versions = list(record.get("versions", []))
@@ -864,7 +1317,10 @@ class ToolRegistry:
             "path": str(path),
             "versions": versions[-10:],
         }
-        self._skills_manifest_path.write_text(json.dumps({"skills": manifest}, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._skills_manifest_path.write_text(
+            json.dumps({"skills": manifest}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     def _restore_skill_version(self, slug: str, version: str) -> dict[str, Any]:
         manifest = self._skill_manifest()
@@ -899,7 +1355,9 @@ class ToolRegistry:
                     break
 
         if selected_path is None or not selected_path.exists():
-            raise FileNotFoundError(f"Unable to restore skill '{slug}' from the recorded versions.")
+            raise FileNotFoundError(
+                f"Unable to restore skill '{slug}' from the recorded versions."
+            )
 
         target_path = self.settings.skills_dir / f"{slug}.py"
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -907,10 +1365,17 @@ class ToolRegistry:
         module = self._import_skill_module(slug, target_path)
         export_name = self._find_skill_export(module, slug)
         if export_name is None:
-            raise ValueError(f"Restored skill '{slug}' does not expose a callable entry point.")
-        self.register_tool(slug, self._build_skill_wrapper(slug, getattr(module, export_name)))
+            raise ValueError(
+                f"Restored skill '{slug}' does not expose a callable entry point."
+            )
+        self.register_tool(
+            slug, self._build_skill_wrapper(slug, getattr(module, export_name))
+        )
         record["path"] = str(target_path)
-        self._skills_manifest_path.write_text(json.dumps({"skills": manifest}, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._skills_manifest_path.write_text(
+            json.dumps({"skills": manifest}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
         return {"path": str(target_path), "restored_from": str(selected_path)}
 
     def _skill_manifest(self) -> dict[str, Any]:
@@ -945,14 +1410,101 @@ class ToolRegistry:
         spec.loader.exec_module(module)  # type: ignore[union-attr]
         return module
 
-    def _build_skill_wrapper(self, slug: str, skill_callable: Callable[..., Any]) -> ToolHandler:
+    def _build_skill_wrapper(
+        self, slug: str, skill_callable: Callable[..., Any]
+    ) -> ToolHandler:
         async def _wrapped(arguments: dict[str, Any], context: ToolContext) -> Any:
-            result = skill_callable(**arguments)
+            call_args, call_kwargs = self._prepare_skill_arguments(
+                skill_callable, arguments, context
+            )
+            result = skill_callable(*call_args, **call_kwargs)
             if inspect.isawaitable(result):
                 result = await result
             return result
 
         return _wrapped
+
+    @staticmethod
+    def _prepare_skill_arguments(
+        skill_callable: Callable[..., Any],
+        arguments: dict[str, Any],
+        context: ToolContext,
+    ) -> tuple[list[Any], dict[str, Any]]:
+        try:
+            signature = inspect.signature(skill_callable)
+        except (TypeError, ValueError):
+            return [], dict(arguments)
+
+        injectables: dict[str, Any] = {
+            "context": context,
+            "tool_context": context,
+            "lisa_context": context,
+            "settings": context.settings,
+            "notepad": context.notepad,
+            "llm_client": context.llm_client,
+            "constitution": context.constitution,
+            "event_bus": context.event_bus,
+            "session_id": context.session_id,
+            "trace_id": context.trace_id,
+            "arguments": arguments,
+            "payload": arguments,
+            "data": arguments,
+        }
+        params = list(signature.parameters.values())
+        if not params:
+            return [], {}
+
+        has_var_keyword = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in params
+        )
+        call_args: list[Any] = []
+        call_kwargs: dict[str, Any] = {}
+        unresolved_required: list[inspect.Parameter] = []
+
+        for param in params:
+            if param.kind == inspect.Parameter.VAR_POSITIONAL:
+                continue
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                continue
+            if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+                if param.name in arguments:
+                    call_args.append(arguments[param.name])
+                    continue
+                if param.name in injectables:
+                    call_args.append(injectables[param.name])
+                    continue
+                if param.default is inspect._empty:
+                    unresolved_required.append(param)
+                continue
+
+            if param.name in arguments:
+                call_kwargs[param.name] = arguments[param.name]
+                continue
+            if param.name in injectables:
+                call_kwargs[param.name] = injectables[param.name]
+                continue
+            if param.default is inspect._empty:
+                unresolved_required.append(param)
+
+        if has_var_keyword:
+            for key, value in arguments.items():
+                call_kwargs.setdefault(key, value)
+
+        if not call_args and not call_kwargs and len(unresolved_required) == 1:
+            only_param = unresolved_required[0]
+            if only_param.kind == inspect.Parameter.POSITIONAL_ONLY:
+                call_args.append(arguments)
+            else:
+                call_kwargs[only_param.name] = arguments
+            unresolved_required.clear()
+
+        if unresolved_required:
+            missing = ", ".join(param.name for param in unresolved_required)
+            raise TypeError(
+                f"Skill wrapper could not satisfy required parameters: {missing}"
+            )
+
+        return call_args, call_kwargs
 
 
 @dataclass(slots=True)

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import httpx
 
+from safety.input_sanitizer import sanitize_user_visible_text
 
 ChannelName = Literal["direct", "telegram", "slack", "whatsapp"]
 
@@ -30,18 +30,31 @@ class ChannelCredentials:
     def from_mapping(cls, mapping: dict[str, Any] | None) -> "ChannelCredentials":
         mapping = mapping or {}
         return cls(
-            telegram_bot_token=_clean(mapping.get("telegram_bot_token") or mapping.get("telegram_token")),
-            telegram_default_chat_id=_clean(
-                mapping.get("telegram_default_chat_id") or mapping.get("telegram_chat_id")
+            telegram_bot_token=_clean(
+                mapping.get("telegram_bot_token") or mapping.get("telegram_token")
             ),
-            slack_bot_token=_clean(mapping.get("slack_bot_token") or mapping.get("slack_token")),
+            telegram_default_chat_id=_clean(
+                mapping.get("telegram_default_chat_id")
+                or mapping.get("telegram_chat_id")
+            ),
+            slack_bot_token=_clean(
+                mapping.get("slack_bot_token") or mapping.get("slack_token")
+            ),
             slack_default_channel=_clean(
                 mapping.get("slack_default_channel") or mapping.get("slack_channel")
             ),
-            whatsapp_account_sid=_clean(mapping.get("whatsapp_account_sid") or mapping.get("twilio_account_sid")),
-            whatsapp_auth_token=_clean(mapping.get("whatsapp_auth_token") or mapping.get("twilio_auth_token")),
-            whatsapp_from_number=_clean(mapping.get("whatsapp_from_number") or mapping.get("twilio_from_number")),
-            whatsapp_default_to=_clean(mapping.get("whatsapp_default_to") or mapping.get("whatsapp_to")),
+            whatsapp_account_sid=_clean(
+                mapping.get("whatsapp_account_sid") or mapping.get("twilio_account_sid")
+            ),
+            whatsapp_auth_token=_clean(
+                mapping.get("whatsapp_auth_token") or mapping.get("twilio_auth_token")
+            ),
+            whatsapp_from_number=_clean(
+                mapping.get("whatsapp_from_number") or mapping.get("twilio_from_number")
+            ),
+            whatsapp_default_to=_clean(
+                mapping.get("whatsapp_default_to") or mapping.get("whatsapp_to")
+            ),
         )
 
     def configured_channels(self) -> list[str]:
@@ -50,7 +63,11 @@ class ChannelCredentials:
             configured.append("telegram")
         if self.slack_bot_token:
             configured.append("slack")
-        if self.whatsapp_account_sid and self.whatsapp_auth_token and self.whatsapp_from_number:
+        if (
+            self.whatsapp_account_sid
+            and self.whatsapp_auth_token
+            and self.whatsapp_from_number
+        ):
             configured.append("whatsapp")
         configured.append("direct")
         return configured
@@ -75,7 +92,9 @@ class ChannelDispatchResult:
 
 
 class ChannelGateway:
-    def __init__(self, credentials: ChannelCredentials | None = None, timeout_seconds: int = 30):
+    def __init__(
+        self, credentials: ChannelCredentials | None = None, timeout_seconds: int = 30
+    ):
         self.credentials = credentials or ChannelCredentials()
         self.timeout_seconds = timeout_seconds
 
@@ -101,20 +120,40 @@ class ChannelGateway:
             ],
         }
 
-    async def send_typing(self, channel: ChannelName, user_id: str | None = None) -> dict[str, Any]:
+    async def send_typing(
+        self, channel: ChannelName, user_id: str | None = None
+    ) -> dict[str, Any]:
         if channel != "telegram":
-            return {"channel": channel, "delivered": False, "detail": "typing indicators are only supported for Telegram"}
+            return {
+                "channel": channel,
+                "delivered": False,
+                "detail": "typing indicators are only supported for Telegram",
+            }
         if not self.credentials.telegram_bot_token:
-            return {"channel": channel, "delivered": False, "detail": "telegram bot token not configured"}
+            return {
+                "channel": channel,
+                "delivered": False,
+                "detail": "telegram bot token not configured",
+            }
         chat_id = user_id or self.credentials.telegram_default_chat_id
         if not chat_id:
-            return {"channel": channel, "delivered": False, "detail": "telegram chat id missing"}
+            return {
+                "channel": channel,
+                "delivered": False,
+                "detail": "telegram chat id missing",
+            }
         payload = {"chat_id": chat_id, "action": "typing"}
         return await self._telegram_api("sendChatAction", payload)
 
-    async def answer_callback(self, callback_query_id: str, text: str | None = None, show_alert: bool = False) -> dict[str, Any]:
+    async def answer_callback(
+        self, callback_query_id: str, text: str | None = None, show_alert: bool = False
+    ) -> dict[str, Any]:
         if not self.credentials.telegram_bot_token:
-            return {"channel": "telegram", "delivered": False, "detail": "telegram bot token not configured"}
+            return {
+                "channel": "telegram",
+                "delivered": False,
+                "detail": "telegram bot token not configured",
+            }
         payload: dict[str, Any] = {
             "callback_query_id": callback_query_id,
             "show_alert": show_alert,
@@ -136,6 +175,7 @@ class ChannelGateway:
     ) -> dict[str, Any]:
         metadata = metadata or {}
         delivery_hints = delivery_hints or {}
+        text = sanitize_user_visible_text(text, max_length=4_000)
 
         if channel == "direct":
             return {
@@ -150,9 +190,11 @@ class ChannelGateway:
                 text=text,
                 chat_id=user_id,
                 parse_mode=parse_mode or delivery_hints.get("parse_mode"),
-                reply_to_message_id=reply_to_message_id or metadata.get("reply_to_message_id"),
+                reply_to_message_id=reply_to_message_id
+                or metadata.get("reply_to_message_id"),
                 reply_markup=delivery_hints.get("reply_markup"),
                 callback_query_id=metadata.get("telegram_callback_query_id"),
+                edit_message_id=delivery_hints.get("edit_message_id"),
             )
 
         if channel == "slack":
@@ -186,13 +228,24 @@ class ChannelGateway:
         reply_to_message_id: int | None,
         reply_markup: dict[str, Any] | None,
         callback_query_id: str | None = None,
+        edit_message_id: int | str | None = None,
     ) -> dict[str, Any]:
         if not self.credentials.telegram_bot_token:
-            return {"channel": "telegram", "delivered": False, "message": text, "detail": "telegram bot token not configured"}
+            return {
+                "channel": "telegram",
+                "delivered": False,
+                "message": text,
+                "detail": "telegram bot token not configured",
+            }
 
         target_chat_id = chat_id or self.credentials.telegram_default_chat_id
         if not target_chat_id:
-            return {"channel": "telegram", "delivered": False, "message": text, "detail": "telegram chat id missing"}
+            return {
+                "channel": "telegram",
+                "delivered": False,
+                "message": text,
+                "detail": "telegram chat id missing",
+            }
 
         if callback_query_id:
             await self.answer_callback(callback_query_id, text=None)
@@ -211,7 +264,25 @@ class ChannelGateway:
         if len(text) > 3500:
             payload["text"] = text[:3500] + "..."
 
+        if edit_message_id is not None:
+            edit_payload = dict(payload)
+            edit_payload["message_id"] = int(edit_message_id)
+            edit_payload.pop("reply_to_message_id", None)
+            return await self._telegram_api("editMessageText", edit_payload)
+
         return await self._telegram_api("sendMessage", payload)
+
+    async def configure_telegram_commands(
+        self, commands: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        if not self.credentials.telegram_bot_token:
+            return {
+                "channel": "telegram",
+                "delivered": False,
+                "detail": "telegram bot token not configured",
+            }
+        payload = {"commands": commands}
+        return await self._telegram_api("setMyCommands", payload)
 
     async def _send_slack(
         self,
@@ -222,11 +293,21 @@ class ChannelGateway:
         delivery_hints: dict[str, Any],
     ) -> dict[str, Any]:
         if not self.credentials.slack_bot_token:
-            return {"channel": "slack", "delivered": False, "message": text, "detail": "slack bot token not configured"}
+            return {
+                "channel": "slack",
+                "delivered": False,
+                "message": text,
+                "detail": "slack bot token not configured",
+            }
 
         target_channel = channel_id or self.credentials.slack_default_channel
         if not target_channel:
-            return {"channel": "slack", "delivered": False, "message": text, "detail": "slack channel missing"}
+            return {
+                "channel": "slack",
+                "delivered": False,
+                "message": text,
+                "detail": "slack channel missing",
+            }
 
         payload: dict[str, Any] = {
             "channel": target_channel,
@@ -246,7 +327,9 @@ class ChannelGateway:
             "Content-Type": "application/json; charset=utf-8",
         }
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.post("https://slack.com/api/chat.postMessage", headers=headers, json=payload)
+            response = await client.post(
+                "https://slack.com/api/chat.postMessage", headers=headers, json=payload
+            )
             response.raise_for_status()
             body = response.json()
 
@@ -280,11 +363,14 @@ class ChannelGateway:
 
         target_to = to or self.credentials.whatsapp_default_to
         if not target_to:
-            return {"channel": "whatsapp", "delivered": False, "message": text, "detail": "whatsapp recipient missing"}
+            return {
+                "channel": "whatsapp",
+                "delivered": False,
+                "message": text,
+                "detail": "whatsapp recipient missing",
+            }
 
-        url = (
-            f"https://api.twilio.com/2010-04-01/Accounts/{self.credentials.whatsapp_account_sid}/Messages.json"
-        )
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{self.credentials.whatsapp_account_sid}/Messages.json"
         payload = {
             "From": self.credentials.whatsapp_from_number,
             "To": target_to,
@@ -293,7 +379,10 @@ class ChannelGateway:
         if metadata.get("media_url"):
             payload["MediaUrl"] = metadata["media_url"]
 
-        auth = (self.credentials.whatsapp_account_sid, self.credentials.whatsapp_auth_token)
+        auth = (
+            self.credentials.whatsapp_account_sid,
+            self.credentials.whatsapp_auth_token,
+        )
         async with httpx.AsyncClient(timeout=self.timeout_seconds, auth=auth) as client:
             response = await client.post(url, data=payload)
             response.raise_for_status()
@@ -307,7 +396,9 @@ class ChannelGateway:
             "detail": None,
         }
 
-    async def _telegram_api(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _telegram_api(
+        self, method: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         url = f"https://api.telegram.org/bot{self.credentials.telegram_bot_token}/{method}"
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.post(url, json=payload)
@@ -318,6 +409,9 @@ class ChannelGateway:
             "delivered": bool(body.get("ok")),
             "message": payload.get("text", ""),
             "payload": body,
-            "detail": None if body.get("ok") else body.get("description", "telegram delivery failed"),
+            "detail": (
+                None
+                if body.get("ok")
+                else body.get("description", "telegram delivery failed")
+            ),
         }
-

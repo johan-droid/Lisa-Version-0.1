@@ -1,7 +1,6 @@
 import asyncio
 import json
 import re
-from collections import Counter
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -19,6 +18,7 @@ class EvolutionSkillSpec:
     code: str
     test_command: str
     notes: list[str] = field(default_factory=list)
+    smoke_test_arguments: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -78,7 +78,9 @@ class NightlyEvolutionScheduler:
         async with self._cycle_lock:
             now = self._now()
             if not force and not self.enabled:
-                return EvolutionCycleResult(status="skipped", candidate_count=0, skipped_reason="disabled")
+                return EvolutionCycleResult(
+                    status="skipped", candidate_count=0, skipped_reason="disabled"
+                )
             idle_threshold = self._idle_threshold_seconds(now)
             if not force and not self._is_idle(now, idle_threshold):
                 return EvolutionCycleResult(
@@ -86,6 +88,43 @@ class NightlyEvolutionScheduler:
                     candidate_count=0,
                     skipped_reason=f"recent_activity_under_{idle_threshold}s",
                 )
+
+            engine = getattr(self.runtime, "evolution_engine", None)
+            if engine is not None:
+                await self.event_bus.publish(
+                    LisaEvent(
+                        type="evolution.cycle_started",
+                        payload={"candidate_count": 0, "engine": "scored"},
+                    )
+                )
+                engine_result = await engine.run_nightly_cycle()
+                status = str(engine_result.get("status") or "completed")
+                details = [
+                    json.dumps(item, ensure_ascii=False)
+                    for item in engine_result.get("results", [])
+                ]
+                result = EvolutionCycleResult(
+                    status=status,
+                    candidate_count=int(engine_result.get("candidate_count", 0) or 0),
+                    details=details,
+                    registered=any(
+                        bool(item.get("accepted"))
+                        for item in engine_result.get("results", [])
+                    ),
+                )
+                await self._write_cycle_record(result, [])
+                await self.event_bus.publish(
+                    LisaEvent(
+                        type="evolution.cycle_finished",
+                        payload={
+                            "status": result.status,
+                            "candidate_count": result.candidate_count,
+                            "details": result.details,
+                        },
+                    )
+                )
+                self._last_attempt_at = now
+                return result
 
             clusters = await self._collect_failure_clusters()
             if not clusters:
@@ -104,28 +143,40 @@ class NightlyEvolutionScheduler:
                 )
             )
 
-            result = EvolutionCycleResult(status="running", candidate_count=candidate_count)
+            result = EvolutionCycleResult(
+                status="running", candidate_count=candidate_count
+            )
             for cluster in clusters:
                 try:
                     knowledge_sources = await self._collect_fresh_knowledge(cluster)
                     result.knowledge_sources = knowledge_sources
-                    skill = await self._synthesize_skill(cluster=cluster, knowledge_sources=knowledge_sources)
+                    skill = await self._synthesize_skill(
+                        cluster=cluster, knowledge_sources=knowledge_sources
+                    )
                     result.skill_name = skill.name
                     result.details.extend(skill.notes)
 
                     stage_path = self._stage_path_for(skill.name)
-                    stage_rel_path = stage_path.relative_to(self.runtime.settings.workspace_root).as_posix()
+                    stage_rel_path = stage_path.relative_to(
+                        self.runtime.settings.workspace_root
+                    ).as_posix()
                     await self._stage_skill(stage_path, skill.code)
 
-                    test_command = self._format_test_command(skill.test_command, stage_rel_path)
+                    test_command = self._format_test_command(
+                        skill.test_command, stage_rel_path
+                    )
                     test_output = await self._test_skill(test_command)
                     result.test_passed = bool(test_output.get("returncode", 1) == 0)
                     result.details.append(f"cluster={cluster.theme}")
-                    result.details.append(f"test_returncode={test_output.get('returncode')}")
+                    result.details.append(
+                        f"test_returncode={test_output.get('returncode')}"
+                    )
 
                     if not result.test_passed:
                         result.status = "failed"
-                        result.details.append(test_output.get("stderr") or "skill test failed")
+                        result.details.append(
+                            test_output.get("stderr") or "skill test failed"
+                        )
                         await self._update_dashboard("failed", skill.name)
                         await self._write_cycle_record(result, clusters)
                         await self.event_bus.publish(
@@ -142,8 +193,49 @@ class NightlyEvolutionScheduler:
                         )
                         return result
 
-                    await self._register_skill(skill)
+                    await self._register_skill(skill, cluster=cluster)
                     result.registered = True
+                    verification = await self._verify_registered_skill(skill)
+                    if not verification["success"]:
+                        result.status = "failed"
+                        result.details.append(
+                            f"post_register_verification_failed={verification['error']}"
+                        )
+                        rollback_result = await self._rollback_skill(skill.name)
+                        if rollback_result["success"]:
+                            result.details.append(
+                                f"rollback={rollback_result['detail']}"
+                            )
+                            await self.event_bus.publish(
+                                LisaEvent(
+                                    type="evolution.skill_rolled_back",
+                                    payload={
+                                        "skill_name": skill.name,
+                                        "cluster": cluster.theme,
+                                        "detail": rollback_result["detail"],
+                                    },
+                                )
+                            )
+                        else:
+                            result.details.append(
+                                f"rollback_failed={rollback_result['detail']}"
+                            )
+                        await self._update_dashboard("failed", skill.name)
+                        await self._write_cycle_record(result, clusters)
+                        await self.event_bus.publish(
+                            LisaEvent(
+                                type="evolution.cycle_finished",
+                                payload={
+                                    "status": result.status,
+                                    "skill_name": skill.name,
+                                    "candidate_count": candidate_count,
+                                    "cluster": cluster.theme,
+                                    "details": result.details,
+                                },
+                            )
+                        )
+                        return result
+
                     result.status = "registered"
                     await self._update_dashboard("registered", skill.name)
                     await self.event_bus.publish(
@@ -154,6 +246,7 @@ class NightlyEvolutionScheduler:
                                 "candidate_count": candidate_count,
                                 "cluster": cluster.theme,
                                 "test_command": test_command,
+                                "verification": verification["detail"],
                             },
                         )
                     )
@@ -199,7 +292,10 @@ class NightlyEvolutionScheduler:
                 await self.run_once()
             except Exception as exc:  # pragma: no cover - defensive loop guard
                 await self.event_bus.publish(
-                    LisaEvent(type="evolution.cycle_finished", payload={"status": "error", "error": str(exc)})
+                    LisaEvent(
+                        type="evolution.cycle_finished",
+                        payload={"status": "error", "error": str(exc)},
+                    )
                 )
 
             try:
@@ -241,7 +337,11 @@ class NightlyEvolutionScheduler:
         if callable(source):
             timestamp = source()
             if isinstance(timestamp, datetime):
-                return timestamp if timestamp.tzinfo is not None else timestamp.astimezone()
+                return (
+                    timestamp
+                    if timestamp.tzinfo is not None
+                    else timestamp.astimezone()
+                )
 
         latest_entries = self.runtime.notepad.latest_entries(limit=1)
         if not latest_entries:
@@ -282,7 +382,9 @@ class NightlyEvolutionScheduler:
         return await asyncio.to_thread(self.runtime.notepad.latest_entries, 5)
 
     def _failure_items_from_notepad(self) -> list[dict[str, Any]]:
-        failure_reader = getattr(self.runtime.notepad, "recent_failure_interactions", None)
+        failure_reader = getattr(
+            self.runtime.notepad, "recent_failure_interactions", None
+        )
         if callable(failure_reader):
             return list(
                 failure_reader(
@@ -290,12 +392,16 @@ class NightlyEvolutionScheduler:
                     min_reward=float(self.runtime.settings.evolution_min_reward),
                 )
             )
-        return list(self.runtime.notepad.evolution_candidates(
-            self.runtime.settings.evolution_candidate_limit,
-            self.runtime.settings.evolution_min_reward,
-        ))
+        return list(
+            self.runtime.notepad.evolution_candidates(
+                self.runtime.settings.evolution_candidate_limit,
+                self.runtime.settings.evolution_min_reward,
+            )
+        )
 
-    def _clusters_from_candidates(self, candidates: list[dict[str, Any]]) -> list[FailureCluster]:
+    def _clusters_from_candidates(
+        self, candidates: list[dict[str, Any]]
+    ) -> list[FailureCluster]:
         clusters: dict[str, FailureCluster] = {}
         for item in candidates:
             payload = item.get("payload") if isinstance(item, dict) else {}
@@ -304,7 +410,9 @@ class NightlyEvolutionScheduler:
             theme = self._failure_theme_from_payload(payload)
             cluster = clusters.get(theme)
             if cluster is None:
-                cluster = FailureCluster(theme=theme, query=self._cluster_query_from_payload(payload))
+                cluster = FailureCluster(
+                    theme=theme, query=self._cluster_query_from_payload(payload)
+                )
                 clusters[theme] = cluster
             cluster.items.append(item)
             cluster.score = max(cluster.score, float(item.get("score") or 0.0))
@@ -316,12 +424,9 @@ class NightlyEvolutionScheduler:
         )
         return ordered
 
-    async def _collect_fresh_knowledge(self, cluster: FailureCluster) -> list[dict[str, Any]]:
-        if not getattr(self.runtime.settings, "enable_browser_tools", False):
-            browser_sources: list[dict[str, Any]] = []
-        else:
-            browser_sources = []
-
+    async def _collect_fresh_knowledge(
+        self, cluster: FailureCluster
+    ) -> list[dict[str, Any]]:
         queries = self._build_browser_queries(cluster)
         knowledge: list[dict[str, Any]] = []
         for query in queries[: self.runtime.settings.evolution_browser_queries]:
@@ -335,8 +440,18 @@ class NightlyEvolutionScheduler:
                 except Exception:
                     search_result = None
                 if search_result is not None:
-                    knowledge.append({"cluster": cluster.theme, "query": query, "search": search_result})
-                    results = search_result.get("results") if isinstance(search_result, dict) else None
+                    knowledge.append(
+                        {
+                            "cluster": cluster.theme,
+                            "query": query,
+                            "search": search_result,
+                        }
+                    )
+                    results = (
+                        search_result.get("results")
+                        if isinstance(search_result, dict)
+                        else None
+                    )
                     if isinstance(results, list):
                         for item in results[:2]:
                             url = item.get("url") if isinstance(item, dict) else None
@@ -350,7 +465,13 @@ class NightlyEvolutionScheduler:
                                 )
                             except Exception:
                                 continue
-                            knowledge.append({"cluster": cluster.theme, "query": query, "fetch": fetch_result})
+                            knowledge.append(
+                                {
+                                    "cluster": cluster.theme,
+                                    "query": query,
+                                    "fetch": fetch_result,
+                                }
+                            )
 
             research_prompt = (
                 "Given this failure cluster and the surrounding documentation findings, "
@@ -364,7 +485,7 @@ class NightlyEvolutionScheduler:
                 llm_result = await self.runtime.tools.invoke(
                     "call_external_llm",
                     {
-                        "provider": self.runtime.settings.freellmapi_default_provider or self.runtime.settings.model_provider or "",
+                        "provider": self._external_provider_hint(),
                         "model": self.runtime.settings.model_name or "",
                         "prompt": research_prompt,
                         "max_tokens": 512,
@@ -376,7 +497,9 @@ class NightlyEvolutionScheduler:
                     ConstitutionMode.UNRESTRICTED,
                 )
                 if isinstance(llm_result, dict):
-                    knowledge.append({"cluster": cluster.theme, "query": query, "llm": llm_result})
+                    knowledge.append(
+                        {"cluster": cluster.theme, "query": query, "llm": llm_result}
+                    )
             except Exception:
                 continue
 
@@ -392,13 +515,13 @@ class NightlyEvolutionScheduler:
             result = await self.runtime.tools.invoke(
                 "call_external_llm",
                 {
-                    "provider": self.runtime.settings.freellmapi_default_provider or self.runtime.settings.model_provider or "",
+                    "provider": self._external_provider_hint(),
                     "model": self.runtime.settings.model_name or "",
                     "prompt": prompt,
                     "max_tokens": 1200,
                     "system_prompt": (
                         "You are the Evolution Engine for LISA. "
-                        "Return only strict JSON with keys name, description, code, test_command, notes. "
+                        "Return only strict JSON with keys name, description, code, test_command, notes, smoke_test_arguments. "
                         "The code must be a single Python function or small module using only the standard library. "
                         "The test_command must reference the staged file with the literal token {path}."
                     ),
@@ -435,7 +558,10 @@ class NightlyEvolutionScheduler:
             description=description,
             code="\n".join(lines),
             test_command="python -m py_compile {path}",
-            notes=["Fallback skill generated because external synthesis was unavailable."],
+            notes=[
+                "Fallback skill generated because external synthesis was unavailable."
+            ],
+            smoke_test_arguments={},
         )
 
     def _parse_skill_spec(
@@ -456,7 +582,9 @@ class NightlyEvolutionScheduler:
         if not isinstance(data, dict):
             return None
 
-        name = self._slugify(str(data.get("name") or cluster.theme or "evolution_helper"))
+        name = self._slugify(
+            str(data.get("name") or cluster.theme or "evolution_helper")
+        )
         description = str(data.get("description") or "Auto-generated evolution skill.")
         code = str(data.get("code") or "").strip()
         body = str(data.get("body") or "").strip()
@@ -468,20 +596,37 @@ class NightlyEvolutionScheduler:
             code = "\n".join(
                 [
                     f"def {name}(context):",
-                    "    \"\"\"Auto-generated evolution skill.\"\"\"",
-                    *[f"    {line}" if line else "    pass" for line in (code.splitlines() or ["pass"])],
+                    '    """Auto-generated evolution skill."""',
+                    *[
+                        f"    {line}" if line else "    pass"
+                        for line in (code.splitlines() or ["pass"])
+                    ],
                 ]
             )
 
-        test_command = str(data.get("test_command") or "python -m py_compile {path}").strip()
+        test_command = str(
+            data.get("test_command") or "python -m py_compile {path}"
+        ).strip()
         notes = data.get("notes")
-        note_items = [str(item) for item in notes if isinstance(item, (str, int, float))] if isinstance(notes, list) else []
+        note_items = (
+            [str(item) for item in notes if isinstance(item, (str, int, float))]
+            if isinstance(notes, list)
+            else []
+        )
+        smoke_test_arguments = data.get(
+            "smoke_test_arguments", data.get("verification_arguments", {})
+        )
+        if not isinstance(smoke_test_arguments, dict):
+            smoke_test_arguments = {}
         return EvolutionSkillSpec(
             name=name,
             description=description,
             code=code,
             test_command=test_command,
             notes=note_items,
+            smoke_test_arguments={
+                str(key): value for key, value in smoke_test_arguments.items()
+            },
         )
 
     async def _stage_skill(self, path: Path, code: str) -> None:
@@ -497,14 +642,94 @@ class NightlyEvolutionScheduler:
             {"command": command, "timeout": 60},
             ConstitutionMode.UNRESTRICTED,
         )
-        return result if isinstance(result, dict) else {"returncode": 1, "stdout": "", "stderr": str(result)}
+        return (
+            result
+            if isinstance(result, dict)
+            else {"returncode": 1, "stdout": "", "stderr": str(result)}
+        )
 
-    async def _register_skill(self, skill: EvolutionSkillSpec) -> None:
-        await self.runtime.tools.invoke(
+    async def _register_skill(
+        self, skill: EvolutionSkillSpec, *, cluster: FailureCluster
+    ) -> dict[str, Any]:
+        result = await self.runtime.tools.invoke(
             "add_skill",
-            {"name": skill.name, "code": skill.code},
+            {
+                "name": skill.name,
+                "code": skill.code,
+                "description": skill.description,
+                "keywords": self._skill_keywords(skill, cluster),
+                "metadata": {
+                    "cluster": cluster.theme,
+                    "notes": skill.notes,
+                    "smoke_test_arguments": skill.smoke_test_arguments,
+                },
+                "storage": "artifact",
+            },
             ConstitutionMode.UNRESTRICTED,
         )
+        return result if isinstance(result, dict) else {"status": "saved"}
+
+    async def _verify_registered_skill(
+        self, skill: EvolutionSkillSpec
+    ) -> dict[str, Any]:
+        try:
+            result = await self.runtime.tools.invoke(
+                skill.name,
+                dict(skill.smoke_test_arguments),
+                ConstitutionMode.UNRESTRICTED,
+            )
+            return {
+                "success": True,
+                "detail": "tool invocation succeeded",
+                "result": result,
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "detail": "tool invocation failed",
+                "error": str(exc),
+            }
+
+    async def _rollback_skill(self, skill_name: str) -> dict[str, Any]:
+        try:
+            result = await self.runtime.tools.invoke(
+                "rollback_skill",
+                {"name": skill_name, "version": "latest"},
+                ConstitutionMode.UNRESTRICTED,
+            )
+            if hasattr(self.runtime.tools, "reload_manifest_skills"):
+                await asyncio.to_thread(self.runtime.tools.reload_manifest_skills)
+            return {
+                "success": True,
+                "detail": "rolled back archived version",
+                "result": result,
+            }
+        except Exception as rollback_error:
+            try:
+                from utils.evolution_guard import rollback_to_latest_snapshot
+
+                restored = await asyncio.to_thread(
+                    rollback_to_latest_snapshot,
+                    skill_name,
+                    self.runtime.settings.skills_dir,
+                    self.runtime.settings.backup_dir,
+                )
+                if restored:
+                    if hasattr(self.runtime.tools, "reload_manifest_skills"):
+                        await asyncio.to_thread(
+                            self.runtime.tools.reload_manifest_skills
+                        )
+                    return {
+                        "success": True,
+                        "detail": "restored skills snapshot",
+                        "result": {"skill_name": skill_name},
+                    }
+            except Exception as snapshot_error:
+                return {
+                    "success": False,
+                    "detail": f"rollback failed: {rollback_error}; snapshot restore failed: {snapshot_error}",
+                }
+            return {"success": False, "detail": f"rollback failed: {rollback_error}"}
 
     async def _update_dashboard(self, status: str, skill_name: str | None) -> None:
         await self.runtime.tools.invoke(
@@ -576,16 +801,47 @@ class NightlyEvolutionScheduler:
         knowledge_sources: list[dict[str, Any]],
     ) -> str:
         failure_digest = json.dumps(cluster.items[:5], ensure_ascii=True, indent=2)
-        knowledge_digest = json.dumps(knowledge_sources[:5], ensure_ascii=True, indent=2)
+        knowledge_digest = json.dumps(
+            knowledge_sources[:5], ensure_ascii=True, indent=2
+        )
         return (
             "Create one new Python skill for LISA.\n"
             "Focus on the most repeated failure theme, keep it small, deterministic, and standard-library only.\n"
-            "Return strict JSON with keys: name, description, code, test_command, notes.\n"
+            "Return strict JSON with keys: name, description, code, test_command, notes, smoke_test_arguments.\n"
             "Use the literal token {path} inside test_command so the scheduler can substitute the staged file path.\n\n"
             f"Cluster theme: {cluster.theme}\n"
             f"Failure candidates:\n{failure_digest}\n\n"
             f"Fresh knowledge:\n{knowledge_digest}\n"
         )
+
+    @staticmethod
+    def _skill_keywords(
+        skill: EvolutionSkillSpec, cluster: FailureCluster
+    ) -> list[str]:
+        keywords: list[str] = []
+        for source in (
+            skill.name,
+            skill.description,
+            cluster.theme,
+            " ".join(skill.notes),
+        ):
+            for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]{2,}", source.lower()):
+                if token not in keywords:
+                    keywords.append(token)
+        return keywords[:24]
+
+    def _external_provider_hint(self) -> str:
+        provider = str(
+            getattr(self.runtime.settings, "freellmapi_default_provider", "") or ""
+        ).strip()
+        if provider:
+            return provider
+        model_provider = str(
+            getattr(self.runtime.settings, "model_provider", "") or ""
+        ).strip()
+        if model_provider and model_provider != "local":
+            return model_provider
+        return ""
 
     def _build_browser_queries(self, cluster: FailureCluster) -> list[str]:
         texts: list[str] = []

@@ -40,5 +40,7 @@ mcp_servers:
     assert app.state.constitution_texts["unrestricted"] == "Lab mode."
     assert settings.workspace_root == workspace_root.resolve()
     assert (workspace_root / "mcp_servers.json").exists()
-    payload = json.loads((workspace_root / "mcp_servers.json").read_text(encoding="utf-8"))
+    payload = json.loads(
+        (workspace_root / "mcp_servers.json").read_text(encoding="utf-8")
+    )
     assert payload["servers"]["filesystem"]["methods"] == ["filesystem.read"]

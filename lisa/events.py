@@ -5,7 +5,6 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
 
 
 @dataclass(slots=True)
@@ -75,4 +74,3 @@ class EventBus:
     async def unsubscribe(self, queue: asyncio.Queue[LisaEvent]) -> None:
         async with self._lock:
             self._subscribers.discard(queue)
-

@@ -1,6 +1,6 @@
 import psutil
 import os
-import sys
+
 
 def profile():
     process = psutil.Process(os.getpid())
@@ -10,6 +10,7 @@ def profile():
         print("MEMORY PROFILE: PASS")
     else:
         print("MEMORY PROFILE: FAIL")
+
 
 if __name__ == "__main__":
     profile()

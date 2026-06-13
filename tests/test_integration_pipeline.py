@@ -29,7 +29,9 @@ def build_settings(tmp_path: Path) -> Settings:
     )
 
 
-def test_full_chat_pipeline_with_mocked_external_model(tmp_path: Path, monkeypatch) -> None:
+def test_full_chat_pipeline_with_mocked_external_model(
+    tmp_path: Path, monkeypatch
+) -> None:
     class FakeResponse:
         def __init__(self, content: str) -> None:
             self._content = content
@@ -40,7 +42,11 @@ def test_full_chat_pipeline_with_mocked_external_model(tmp_path: Path, monkeypat
         def json(self) -> dict[str, object]:
             return {
                 "choices": [{"message": {"content": self._content}}],
-                "usage": {"prompt_tokens": 8, "completion_tokens": 12, "total_tokens": 20},
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 12,
+                    "total_tokens": 20,
+                },
             }
 
     class FakeAsyncClient:
@@ -95,17 +101,26 @@ def test_full_chat_pipeline_with_mocked_external_model(tmp_path: Path, monkeypat
         assert body["message"] == "Hello! I wrote the file and completed the follow-up."
         assert body["tool_calls"] == []
 
-        created_file = tmp_path / "artifacts" / "hello_lisa.txt"
-        assert created_file.exists()
-        assert created_file.read_text(encoding="utf-8") == "Hello from LISA's tool executor."
+        created_files = list((tmp_path / "workspace").rglob("hello_lisa.txt"))
+        assert created_files
+        created_file = created_files[0]
+        assert (
+            created_file.read_text(encoding="utf-8")
+            == "Hello from LISA's tool executor."
+        )
 
         tool_results = client.get("/notepad/search", params={"q": "file_write"})
         assert tool_results.status_code == 200
-        assert any(row["entry_type"] == "tool_call" for row in tool_results.json()["results"])
+        assert any(
+            row["entry_type"] == "tool_call" for row in tool_results.json()["results"]
+        )
 
         summaries = client.get("/notepad/search", params={"q": "task_summary"})
         assert summaries.status_code == 200
-        assert any(row["payload"]["outcome"] == "success" for row in summaries.json()["results"])
+        assert any(
+            row["payload"]["outcome"] == "success"
+            for row in summaries.json()["results"]
+        )
 
 
 def test_terminal_exec_uses_sandboxed_docker_flags(tmp_path: Path, monkeypatch) -> None:
@@ -150,7 +165,9 @@ def test_terminal_exec_uses_sandboxed_docker_flags(tmp_path: Path, monkeypatch) 
         return FakeProcess()
 
     monkeypatch.setattr("lisa.tools.shutil.which", lambda name: "docker")
-    monkeypatch.setattr("lisa.tools.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(
+        "lisa.tools.asyncio.create_subprocess_exec", fake_create_subprocess_exec
+    )
 
     registry = ToolRegistry(
         settings=settings,
@@ -178,7 +195,62 @@ def test_terminal_exec_uses_sandboxed_docker_flags(tmp_path: Path, monkeypatch) 
     assert "ok" in result["stdout"]
 
 
-def test_notepad_search_falls_back_when_fts_query_has_punctuation(tmp_path: Path) -> None:
+def test_terminal_exec_refuses_host_shell_fallback_by_default(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = Settings(
+        workspace_root=tmp_path,
+        db_path=tmp_path / "data" / "test.db",
+        skills_dir=tmp_path / "skills",
+        persona_vectors_path=tmp_path / "data" / "persona_vectors.npz",
+        gating_model_path=tmp_path / "data" / "gating_model.pkl",
+        enable_browser_tools=False,
+        message_hub_enabled=False,
+        evolution_enabled=False,
+        allow_local_terminal_fallback=False,
+    )
+
+    class FakeWriter:
+        async def enqueue(self, *args, **kwargs):
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            future.set_result(1)
+            return future
+
+    class FakeEventBus:
+        async def publish(self, event):
+            return None
+
+    monkeypatch.setattr("lisa.tools.shutil.which", lambda name: None)
+
+    registry = ToolRegistry(
+        settings=settings,
+        notepad=object(),
+        llm_client=object(),
+        event_bus=FakeEventBus(),
+        notepad_writer=FakeWriter(),
+    )
+
+    async def run() -> None:
+        try:
+            await registry.invoke(
+                "terminal_exec",
+                {"command": "python -c \"print('hello')\""},
+                constitution="restricted",
+            )
+        except RuntimeError as exc:
+            assert "local terminal fallback is disabled" in str(exc)
+            return
+        raise AssertionError(
+            "terminal_exec should have refused a host-shell fallback without Docker."
+        )
+
+    asyncio.run(run())
+
+
+def test_notepad_search_falls_back_when_fts_query_has_punctuation(
+    tmp_path: Path,
+) -> None:
     notepad = Notepad(tmp_path / "data" / "test.db")
     notepad.log_entry(
         entry_type="interaction",

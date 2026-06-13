@@ -45,8 +45,12 @@ class PersonaSoftPromptBank:
         rng = np.random.default_rng(seed)
         prompts: dict[str, PersonaSoftPrompt] = {}
         for persona in Persona:
-            vectors = rng.normal(loc=0.0, scale=0.02, size=(tokens, dims)).astype(np.float32)
-            prompts[persona.value] = PersonaSoftPrompt(name=persona.value, vectors=vectors)
+            vectors = rng.normal(loc=0.0, scale=0.02, size=(tokens, dims)).astype(
+                np.float32
+            )
+            prompts[persona.value] = PersonaSoftPrompt(
+                name=persona.value, vectors=vectors
+            )
         return cls(prompts=prompts, tokens=tokens, dims=dims)
 
     @classmethod
@@ -58,7 +62,9 @@ class PersonaSoftPromptBank:
             return cls.load_directory(path)
 
         payload = np.load(path, allow_pickle=False)
-        tokens = int(payload["tokens"]) if "tokens" in payload else DEFAULT_PERSONA_TOKENS
+        tokens = (
+            int(payload["tokens"]) if "tokens" in payload else DEFAULT_PERSONA_TOKENS
+        )
         dims = int(payload["dims"]) if "dims" in payload else DEFAULT_EMBEDDING_DIMS
         prompts: dict[str, PersonaSoftPrompt] = {}
         for persona in Persona:
@@ -66,7 +72,9 @@ class PersonaSoftPromptBank:
             if key not in payload:
                 continue
             vectors = payload[key].astype(np.float32, copy=False)
-            prompts[persona.value] = PersonaSoftPrompt(name=persona.value, vectors=vectors)
+            prompts[persona.value] = PersonaSoftPrompt(
+                name=persona.value, vectors=vectors
+            )
         return cls(prompts=prompts, tokens=tokens, dims=dims)
 
     def save(self, path: Path) -> None:
@@ -90,9 +98,13 @@ class PersonaSoftPromptBank:
     def save_directory(self, directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         metadata = {"tokens": self.tokens, "dims": self.dims}
-        (directory / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        (directory / "metadata.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
+        )
         for name, prompt in self._prompts.items():
-            np.save(directory / f"{name}.npy", prompt.vectors.astype(np.float32, copy=False))
+            np.save(
+                directory / f"{name}.npy", prompt.vectors.astype(np.float32, copy=False)
+            )
 
     @classmethod
     def load_directory(cls, directory: Path) -> "PersonaSoftPromptBank":
@@ -111,7 +123,9 @@ class PersonaSoftPromptBank:
             if not path.exists():
                 continue
             vectors = np.load(path, allow_pickle=False).astype(np.float32, copy=False)
-            prompts[persona.value] = PersonaSoftPrompt(name=persona.value, vectors=vectors)
+            prompts[persona.value] = PersonaSoftPrompt(
+                name=persona.value, vectors=vectors
+            )
         if prompts:
             first = next(iter(prompts.values()))
             tokens, dims = first.vectors.shape
@@ -138,7 +152,9 @@ class PersonaSoftPromptBank:
         return blended / total
 
     def to_tensor(self) -> np.ndarray:
-        tensor = np.zeros((len(PERSONA_ORDER), self.tokens, self.dims), dtype=np.float32)
+        tensor = np.zeros(
+            (len(PERSONA_ORDER), self.tokens, self.dims), dtype=np.float32
+        )
         for index, persona in enumerate(PERSONA_ORDER):
             prompt = self._prompts.get(persona)
             if prompt is None:
@@ -155,7 +171,9 @@ class PersonaSoftPromptBank:
     ) -> "PersonaSoftPromptBank":
         array = np.asarray(tensor, dtype=np.float32)
         if array.ndim != 3:
-            raise ValueError("Persona tensor artifacts must have shape [personas, tokens, dims].")
+            raise ValueError(
+                "Persona tensor artifacts must have shape [personas, tokens, dims]."
+            )
         if array.shape[0] != len(persona_order):
             raise ValueError(
                 f"Persona tensor has {array.shape[0]} personas, expected {len(persona_order)}."
@@ -163,7 +181,9 @@ class PersonaSoftPromptBank:
 
         prompts: dict[str, PersonaSoftPrompt] = {}
         for index, persona in enumerate(persona_order):
-            prompts[persona] = PersonaSoftPrompt(name=persona, vectors=array[index].astype(np.float32, copy=False))
+            prompts[persona] = PersonaSoftPrompt(
+                name=persona, vectors=array[index].astype(np.float32, copy=False)
+            )
         tokens, dims = array.shape[1], array.shape[2]
         return cls(prompts=prompts, tokens=tokens, dims=dims)
 

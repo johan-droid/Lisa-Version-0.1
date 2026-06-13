@@ -20,4 +20,8 @@ class CalendarAwareness:
 
     def today(self) -> list[dict[str, Any]]:
         today = datetime.now(timezone.utc).date().isoformat()
-        return [event for event in self._events if str(event.get("date", "")).startswith(today)]
+        return [
+            event
+            for event in self._events
+            if str(event.get("date", "")).startswith(today)
+        ]

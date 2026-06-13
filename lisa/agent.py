@@ -1,34 +1,47 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from lisa.events import EventBus, LisaEvent
-from lisa.notepad import AsyncNotepadWriter
-from lisa.config import Settings
 from lisa.constitutions import ConstitutionMode, parse_constitution_command
-from lisa.gating import PersonaGatingNetwork
-from lisa.llm import LLMClient
-from lisa.notepad import Notepad
-from lisa.schemas import BrainTask, ChatRequest, ChatResponse, InboundMessage
-from lisa.tool_executor import ToolExecutor
-from lisa.tools import ToolRegistry
+from lisa.events import EventBus, LisaEvent
+from lisa.notepad import AsyncNotepadWriter, Notepad
+from lisa.memory_system import HybridMemoryCoordinator
+from lisa.react_engine import ReActEngine
+from lisa.router import LLMRouter
+from lisa.schemas import (
+    BrainTask,
+    ChatRequest,
+    ChatResponse,
+    EnrichedTask,
+    InboundMessage,
+    TaskResult,
+)
 from personal.context_store import PersonalContextStore
-from safety.input_sanitizer import is_prompt_injection_suspicious, sanitize_text
+from safety.input_sanitizer import (
+    inspect_query_text,
+    inspect_text,
+    sanitize_text,
+    sanitize_user_visible_text,
+)
 
 
 class LisaRuntime:
     def __init__(
         self,
-        settings: Settings,
+        *,
+        settings,
         notepad: Notepad,
-        llm_client: LLMClient,
-        tools: ToolRegistry,
-        tool_executor: ToolExecutor,
+        llm_client,
+        tools,
+        tool_executor,
         event_bus: EventBus,
         notepad_writer: AsyncNotepadWriter,
-        gating: PersonaGatingNetwork,
+        gating,
+        memory=None,
+        llm_router: LLMRouter | None = None,
+        react_engine=None,
+        evolution_engine=None,
         personal_store: PersonalContextStore | None = None,
     ):
         self.settings = settings
@@ -39,6 +52,28 @@ class LisaRuntime:
         self.event_bus = event_bus
         self.notepad_writer = notepad_writer
         self.gating = gating
+        self.memory = memory or HybridMemoryCoordinator(
+            agent_id=str(getattr(settings, "agent_id", "lisa") or "lisa"),
+            namespace=str(
+                getattr(notepad, "db_path", settings.workspace_root / "memory.db")
+            ),
+            redis_url=getattr(settings, "redis_url", None),
+            postgres_dsn=getattr(settings, "postgres_dsn", None),
+            chroma_persist_dir=getattr(settings, "chroma_persist_dir", None),
+            working_ttl_seconds=int(
+                getattr(settings, "working_memory_ttl_seconds", 7200)
+            ),
+            event_bus=event_bus,
+        )
+        self.llm_router = llm_router or LLMRouter(llm_client)
+        self.react_engine = react_engine or ReActEngine(
+            llm_router=self.llm_router,
+            llm_client=llm_client,
+            tool_executor=tool_executor,
+            memory=self.memory,
+            event_bus=event_bus,
+        )
+        self.evolution_engine = evolution_engine
         self.personal_store = personal_store
 
     async def process_chat(self, request: ChatRequest) -> ChatResponse:
@@ -51,262 +86,230 @@ class LisaRuntime:
             session_id=request.session_id,
             priority=0,
         )
-        return await self.process_brain_task(BrainTask(inbound=inbound, max_tokens=request.max_tokens))
+        return await self.process_brain_task(
+            BrainTask(inbound=inbound, max_tokens=request.max_tokens)
+        )
 
     async def process_message(
-        self,
-        inbound: InboundMessage,
-        max_tokens: int = 800,
+        self, inbound: InboundMessage, max_tokens: int = 800
     ) -> ChatResponse:
-        return await self.process_brain_task(BrainTask(inbound=inbound, max_tokens=max_tokens))
+        return await self.process_brain_task(
+            BrainTask(inbound=inbound, max_tokens=max_tokens)
+        )
 
     async def process_brain_task(self, task: BrainTask) -> ChatResponse:
-        inbound = task.inbound
-        session_id = inbound.session_id or str(uuid4())
+        task_id = task.inbound.session_id or str(uuid4())
+        enriched = await self.enrich_task(task_id=task_id, task=task)
+        return await self.process_enriched_task(enriched)
+
+    async def enrich_task(self, *, task_id: str, task: BrainTask) -> EnrichedTask:
+        inbound = task.inbound.model_copy(update={"session_id": task_id})
         sanitized_text = sanitize_text(inbound.text)
-        if is_prompt_injection_suspicious(sanitized_text):
-            await self.notepad_writer.enqueue(
-                entry_type="interaction",
-                payload={
-                    "session_id": session_id,
-                    "source": inbound.source,
-                    "user_id": inbound.user_id,
-                    "channel": inbound.channel,
-                    "user_message": inbound.text,
-                    "assistant_message": "I can help with the task itself, but I won't follow instructions that try to override safety or system behavior.",
-                    "tool_suggestions": [],
-                    "notes": ["Rejected suspicious prompt-injection content."],
-                    "context": [],
-                    "tool_results": [],
-                },
-                constitution=ConstitutionMode.RESTRICTED,
-                personas={"guardian": 1.0},
+        inspection = inspect_text(sanitized_text)
+        query_inspection = inspect_query_text(sanitized_text)
+        if inspection.suspicious:
+            await self.event_bus.publish(
+                LisaEvent(
+                    type="security.prompt_flagged",
+                    payload={
+                        "task_id": task_id,
+                        "risk_score": inspection.risk_score,
+                        "reasons": inspection.reasons,
+                    },
+                    session_id=task_id,
+                    trace_id=task_id,
+                )
             )
-            return ChatResponse(
-                session_id=session_id,
-                message=(
-                    "I can help with the task itself, but I won't follow instructions "
-                    "that try to override safety or system behavior."
-                ),
-                constitution=ConstitutionMode.RESTRICTED.value,
-                personas={"guardian": 1.0},
-                tool_suggestions=[],
-                tool_calls=[],
-                used_external_model=False,
-                notes=["Suspicious prompt content rejected."],
+        if query_inspection.suspicious:
+            await self.event_bus.publish(
+                LisaEvent(
+                    type="security.query_flagged",
+                    payload={
+                        "task_id": task_id,
+                        "reasons": query_inspection.reasons,
+                    },
+                    session_id=task_id,
+                    trace_id=task_id,
+                )
             )
-        current_mode = (
-            ConstitutionMode(task.constitution)
-            if task.constitution is not None
-            else ConstitutionMode(self.notepad.get_constitution_state()["mode"])
+
+        constitution_state = self.notepad.get_constitution_state()
+        constitution = task.constitution or str(
+            constitution_state["mode"] or ConstitutionMode.RESTRICTED.value
         )
-        personas = task.persona_weights or self.gating.predict_blend(sanitized_text)
-        notes: list[str] = []
-        used_external_model = False
-        tool_calls: list = []
-        trace_id = str(uuid4())
+        persona_weights = task.persona_weights or self.gating.predict_blend(
+            sanitized_text
+        )
+        memory_context = await self.memory.enrich_task(
+            task_id=task_id, description=sanitized_text
+        )
+        personal_summary = (
+            self.personal_store.summary() if self.personal_store is not None else {}
+        )
+        route = await self.llm_router.route(
+            sanitized_text,
+            {
+                "memory_context": memory_context.similar_episodes,
+                "skill_context": memory_context.relevant_skills,
+                "personal_summary": personal_summary,
+            },
+        )
+        return EnrichedTask(
+            task_id=task_id,
+            agent_id=self.memory.agent_id,
+            inbound=inbound.model_copy(update={"text": sanitized_text}),
+            description=sanitized_text,
+            max_tokens=task.max_tokens,
+            constitution=constitution,
+            persona_weights=persona_weights,
+            memory_context=memory_context.similar_episodes,
+            skill_context=memory_context.relevant_skills,
+            working_memory_key=memory_context.working_memory_key,
+            stress_level=task.stress_level,
+            metadata={
+                "task_type": route.task_type,
+                "route_brain": route.brain,
+                "route_reason": route.reason,
+                "personal_context": personal_summary,
+                "approved_levels": list(
+                    inbound.metadata.get("approved_levels") or ["L0", "L1"]
+                ),
+                "explicit_user_grant": bool(
+                    inbound.metadata.get("explicit_user_grant", False)
+                ),
+                "two_factor_confirmed": bool(
+                    inbound.metadata.get("two_factor_confirmed", False)
+                ),
+            },
+        )
+
+    async def process_enriched_task(self, enriched_task: EnrichedTask) -> ChatResponse:
+        constitution_command = parse_constitution_command(enriched_task.inbound.text)
+        if constitution_command is not None:
+            target_mode = constitution_command.target_mode
+            reason = (
+                constitution_command.reason
+                if target_mode == ConstitutionMode.UNRESTRICTED
+                else "User disabled lab mode"
+            )
+            if (
+                target_mode == ConstitutionMode.UNRESTRICTED
+                and not constitution_command.reason
+            ):
+                return ChatResponse(
+                    session_id=enriched_task.task_id,
+                    message="Unrestricted mode was not enabled because an explicit reason is required.",
+                    constitution=ConstitutionMode.RESTRICTED.value,
+                    personas={"guardian": 1.0},
+                    tool_suggestions=[],
+                    used_external_model=False,
+                    notes=[
+                        "Constitution switch rejected because the reason was missing."
+                    ],
+                )
+            self.notepad.set_constitution_mode(target_mode, reason)
+            return ChatResponse(
+                session_id=enriched_task.task_id,
+                message="Constitution updated.",
+                constitution=target_mode.value,
+                personas=enriched_task.persona_weights,
+                tool_suggestions=[],
+                used_external_model=False,
+                notes=[f"Constitution switched to {target_mode.value}."],
+            )
 
         await self.event_bus.publish(
             LisaEvent(
                 type="chat.received",
                 payload={
-                    "source": inbound.source,
-                    "user_id": inbound.user_id,
-                    "channel": inbound.channel,
-                    "text": inbound.text,
+                    "source": enriched_task.inbound.source,
+                    "user_id": enriched_task.inbound.user_id,
+                    "channel": enriched_task.inbound.channel,
+                    "task_id": enriched_task.task_id,
                 },
-                trace_id=trace_id,
-                session_id=session_id,
+                session_id=enriched_task.task_id,
+                trace_id=enriched_task.task_id,
             )
         )
 
+        result = await self.react_engine.run(enriched_task)
+        response = self._result_to_response(enriched_task, result)
+        safe_answer = response.message
+        if not result.success and self.evolution_engine is not None:
+            triggered = await self.evolution_engine.note_task_failure(
+                str(enriched_task.metadata.get("task_type") or "react_task")
+            )
+            if triggered:
+                response.notes.append(
+                    "Emergency evolution trigger fired after repeated failures."
+                )
         await self.notepad_writer.enqueue(
-            entry_type="interaction_start",
-            payload={
-                "session_id": session_id,
-                "source": inbound.source,
-                "user_id": inbound.user_id,
-                "channel": inbound.channel,
-                "user_message": inbound.text,
-                "timestamp": inbound.timestamp.isoformat(),
-            },
-            constitution=current_mode,
-            personas=personas,
-        )
-
-        await self.notepad_writer.flush_pending()
-        if task.context_summary:
-            context_summary = task.context_summary
-        else:
-            context_entries = await asyncio.to_thread(self.notepad.search, sanitized_text, 5)
-            context_summary = [
-                {
-                    "entry_type": row["entry_type"],
-                    "payload": row["payload"],
-                    "constitution": row["constitution"],
-                }
-                for row in context_entries
-            ]
-
-        constitution_command = parse_constitution_command(inbound.text)
-        if constitution_command is not None:
-            if constitution_command.target_mode == ConstitutionMode.UNRESTRICTED:
-                if not constitution_command.reason:
-                    reply_text = (
-                        "Unrestricted mode was not enabled because a reason is required. "
-                        "Use: ENABLE UNRESTRICTED MODE [reason]"
-                    )
-                    notes.append("Constitution switch rejected because the reason was missing.")
-                else:
-                    await asyncio.to_thread(
-                        self.notepad.set_constitution_mode,
-                        ConstitutionMode.UNRESTRICTED,
-                        constitution_command.reason,
-                    )
-                    current_mode = ConstitutionMode.UNRESTRICTED
-                    reply_text = (
-                        "Unrestricted mode enabled for this workspace. "
-                        "The switch was logged in the Notepad and should surface as a dashboard warning."
-                    )
-                    notes.append(f"Reason logged: {constitution_command.reason}")
-            else:
-                await asyncio.to_thread(
-                    self.notepad.set_constitution_mode,
-                    ConstitutionMode.RESTRICTED,
-                    "User disabled lab mode",
-                )
-                current_mode = ConstitutionMode.RESTRICTED
-                reply_text = "Restricted mode restored. Safe defaults are active again."
-        else:
-            system_prompt = self._build_system_prompt(current_mode, personas, context_summary, sanitized_text)
-            if task.tool_results:
-                tool_result_summary = [
-                    {
-                        "tool": result.tool,
-                        "success": result.success,
-                        "output": result.output,
-                        "error": result.error,
-                        "attempt": result.attempt,
-                    }
-                    for result in task.tool_results
-                ]
-                system_prompt += f" Tool results from the previous arm: {tool_result_summary}."
-            if self.llm_client.configured or self.llm_client.supports_local_generation:
-                generation = await self.llm_client.generate_brain(
-                    system_prompt=system_prompt,
-                    user_prompt=sanitized_text,
-                    max_tokens=task.max_tokens,
-                    persona_weights=personas,
-                )
-                reply_text = generation.text
-                tool_calls = generation.tool_calls
-                used_external_model = not generation.used_local_model
-                if tool_calls:
-                    notes.append(f"Model emitted {len(tool_calls)} tool call(s).")
-            else:
-                reply_text = self._bootstrap_reply(current_mode, personas)
-                notes.append(
-                    "No external model is configured yet; returning the deterministic bootstrap response."
-                )
-
-        tool_suggestions = self._suggest_tools(inbound.text)
-        final_future = await self.notepad_writer.enqueue(
             entry_type="interaction",
             payload={
-                "session_id": session_id,
-                "source": inbound.source,
-                "user_id": inbound.user_id,
-                "channel": inbound.channel,
-                "user_message": inbound.text,
-                "assistant_message": reply_text,
-                "tool_suggestions": tool_suggestions,
-                "tool_calls": [tool_call.model_dump() for tool_call in tool_calls],
-                "notes": notes,
-                "context": context_summary,
-                "tool_results": [tool_result.model_dump() for tool_result in task.tool_results],
+                "session_id": enriched_task.task_id,
+                "source": enriched_task.inbound.source,
+                "user_id": enriched_task.inbound.user_id,
+                "channel": enriched_task.inbound.channel,
+                "user_message": enriched_task.inbound.text,
+                "assistant_message": safe_answer,
+                "tool_calls": [tool.model_dump() for tool in result.tool_results],
+                "notes": list(response.notes),
+                "task_type": enriched_task.metadata.get("task_type"),
+                "outcome": "success" if result.success else "error",
+                "error": result.failure_reason,
+                "persona_blend": enriched_task.persona_weights,
             },
-            constitution=current_mode,
-            personas=personas,
+            constitution=response.constitution,
+            personas=enriched_task.persona_weights,
         )
-        await final_future
-
         await self.event_bus.publish(
             LisaEvent(
                 type="chat.responded",
                 payload={
-                    "message": reply_text,
-                    "notes": notes,
-                    "tool_calls": [tool_call.model_dump() for tool_call in tool_calls],
-                    "tool_results": [tool_result.model_dump() for tool_result in task.tool_results],
-                    "personas": personas,
-                    "session_id": session_id,
+                    "message": response.message,
+                    "personas": response.personas,
+                    "tool_calls": [tool.model_dump() for tool in response.tool_calls],
+                    "session_id": response.session_id,
+                    "delivery_hints": response.delivery_hints,
                 },
-                trace_id=trace_id,
-                session_id=session_id,
+                session_id=response.session_id,
+                trace_id=enriched_task.task_id,
             )
         )
+        return response
 
+    def _result_to_response(
+        self, enriched_task: EnrichedTask, result: TaskResult
+    ) -> ChatResponse:
+        route_brain = str(enriched_task.metadata.get("route_brain") or "")
+        used_external_model = route_brain != "tinyllama"
+        if (
+            route_brain == "tinyllama"
+            and not self.llm_client.local_backend_ready
+            and self.llm_client.external_backend_configured
+        ):
+            used_external_model = True
+        safe_answer = sanitize_user_visible_text(result.answer, max_length=8_000)
         return ChatResponse(
-            session_id=session_id,
-            message=reply_text,
-            constitution=current_mode.value,
-            personas=personas,
-            tool_suggestions=tool_suggestions,
-            tool_calls=tool_calls,
+            session_id=enriched_task.task_id,
+            message=safe_answer,
+            constitution=enriched_task.constitution,
+            personas=enriched_task.persona_weights,
+            tool_suggestions=[
+                str(item.get("skill_name") or "")
+                for item in enriched_task.skill_context
+                if item.get("skill_name")
+            ],
+            tool_calls=[],
             used_external_model=used_external_model,
-            notes=notes,
+            notes=[
+                f"route={route_brain}",
+                f"task_type={enriched_task.metadata.get('task_type')}",
+                *(
+                    ["failure=" + str(result.failure_reason)]
+                    if result.failure_reason
+                    else []
+                ),
+            ],
+            delivery_hints={"scratchpad_stream": True},
         )
-
-    def _build_system_prompt(
-        self,
-        constitution: ConstitutionMode,
-        personas: dict[str, float],
-        context_summary: list[dict[str, object]],
-        user_text: str,
-    ) -> str:
-        tool_names = ", ".join(tool.name for tool in self.tools.list_tools())
-        personal_summary = self.personal_store.summary() if self.personal_store is not None else {}
-        return (
-            "You are LISA, a proactive developer agent. "
-            f"Current constitution: {constitution.value}. "
-            f"Persona blend weights: {personas}. "
-            f"Recent memory context: {context_summary}. "
-            f"Personal context: {personal_summary}. "
-            f"Sanitized user request: {user_text}. "
-            "Respect the current constitution strictly, keep user data local by default, "
-            "and prefer production-ready engineering outputs. "
-            f"Available tools: {tool_names}."
-        )
-
-    @staticmethod
-    def _bootstrap_reply(
-        constitution: ConstitutionMode,
-        personas: dict[str, float],
-    ) -> str:
-        dominant = max(personas, key=personas.get)
-        return (
-            f"LISA core is running in {constitution.value} mode. "
-            f"The current dominant cognitive blend is '{dominant}'. "
-            "The ledger, constitution state, and tool registry are live. "
-            "Configure LISA_MODEL_PROVIDER, LISA_MODEL_NAME, LISA_MODEL_BASE_URL, "
-            "and LISA_MODEL_API_KEY to attach an external reasoning model."
-        )
-
-    @staticmethod
-    def _suggest_tools(message: str) -> list[str]:
-        lowered = message.lower()
-        suggestions: list[str] = []
-        if any(keyword in lowered for keyword in ("search", "remember", "history", "notepad")):
-            suggestions.append("search_notepad")
-        if any(keyword in lowered for keyword in ("file", "write", "edit", "read")):
-            suggestions.extend(["file_read", "file_write", "file_edit"])
-        if any(keyword in lowered for keyword in ("run", "command", "shell", "terminal")):
-            suggestions.append("terminal_exec")
-        if any(keyword in lowered for keyword in ("web", "browser", "docs", "search online")):
-            suggestions.extend(["browser_search", "browser_fetch"])
-        if any(keyword in lowered for keyword in ("metric", "dashboard")):
-            suggestions.append("dashboard_update")
-
-        if not suggestions:
-            suggestions.append("search_notepad")
-        return list(dict.fromkeys(suggestions))

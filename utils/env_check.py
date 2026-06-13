@@ -19,11 +19,15 @@ class EnvironmentCheckResult:
             raise EnvironmentError("\n".join(self.errors))
 
 
-def check_environment(settings: Any, bootstrap: Any | None = None) -> EnvironmentCheckResult:
+def check_environment(
+    settings: Any, bootstrap: Any | None = None
+) -> EnvironmentCheckResult:
     result = EnvironmentCheckResult(ok=True)
     workspace_root = Path(getattr(settings, "workspace_root", Path.cwd())).resolve()
 
-    model_path = getattr(settings, "local_model_path", None) or getattr(settings, "model_path", None)
+    model_path = getattr(settings, "local_model_path", None) or getattr(
+        settings, "model_path", None
+    )
     if model_path is not None:
         model_path = Path(model_path)
         if not model_path.exists():
@@ -31,7 +35,9 @@ def check_environment(settings: Any, bootstrap: Any | None = None) -> Environmen
             if _is_truthy(os.environ.get("LISA_REQUIRE_LOCAL_MODEL")):
                 result.errors.append(message)
             else:
-                result.warnings.append(f"{message} (continuing without local inference)")
+                result.warnings.append(
+                    f"{message} (continuing without local inference)"
+                )
 
     docker_error = _check_docker()
     if docker_error:
@@ -49,8 +55,22 @@ def check_environment(settings: Any, bootstrap: Any | None = None) -> Environmen
     except Exception as exc:
         result.errors.append(f"Unable to create backup directory {backup_dir}: {exc}")
 
+    if getattr(settings, "enable_unsafe_admin_endpoints", False) and not getattr(
+        settings, "admin_api_token", None
+    ):
+        result.errors.append(
+            "Unsafe admin endpoints require LISA_ADMIN_API_TOKEN to be configured."
+        )
+
+    if getattr(settings, "bot_security_key", None):
+        result.warnings.append(
+            "LISA_BOT_SECURITY_KEY is deprecated and ignored by the current channel access model."
+        )
+
     if bootstrap is not None and not getattr(bootstrap, "constitution_texts", None):
-        result.warnings.append("No constitution texts were provided; defaults will be used.")
+        result.warnings.append(
+            "No constitution texts were provided; defaults will be used."
+        )
 
     result.ok = not result.errors
     return result

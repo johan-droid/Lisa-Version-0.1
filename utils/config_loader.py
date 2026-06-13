@@ -27,6 +27,7 @@ def _load_config_sync(path: Path) -> dict[str, Any]:
         "path": path,
         "raw": raw,
         "app_name": raw.get("app_name") or settings.get("app_name") or "LISA",
+        "agent_id": raw.get("agent_id") or settings.get("agent_id") or "lisa",
         "workspace_root": _path_or_default(
             raw.get("workspace_root") or settings.get("workspace_root") or ".",
             base=path.parent,
@@ -49,13 +50,39 @@ def _load_config_sync(path: Path) -> dict[str, Any]:
             settings.get("db_path") or raw.get("db_path") or "data/lisa_notepad.db",
             base=path.parent,
         ),
-        "skills_dir": _path_or_default(settings.get("skills_dir") or raw.get("skills_dir") or "skills", base=path.parent),
+        "redis_url": raw.get("redis_url") or settings.get("redis_url"),
+        "postgres_dsn": raw.get("postgres_dsn") or settings.get("postgres_dsn"),
+        "chroma_persist_dir": _path_or_default(
+            settings.get("chroma_persist_dir")
+            or raw.get("chroma_persist_dir")
+            or "data/chroma",
+            base=path.parent,
+        ),
+        "working_memory_ttl_seconds": int(
+            raw.get("working_memory_ttl_seconds")
+            if raw.get("working_memory_ttl_seconds") is not None
+            else settings.get("working_memory_ttl_seconds", 7200)
+        ),
+        "skills_dir": _path_or_default(
+            settings.get("skills_dir") or raw.get("skills_dir") or "skills",
+            base=path.parent,
+        ),
+        "evolution_artifacts_dir": _path_or_default(
+            settings.get("evolution_artifacts_dir")
+            or raw.get("evolution_artifacts_dir")
+            or "data/evolution_artifacts",
+            base=path.parent,
+        ),
         "persona_vectors_path": _path_or_default(
-            settings.get("persona_vectors_path") or raw.get("persona_vectors_path") or "data/persona_vectors.npz",
+            settings.get("persona_vectors_path")
+            or raw.get("persona_vectors_path")
+            or "data/persona_vectors.npz",
             base=path.parent,
         ),
         "gating_model_path": _path_or_default(
-            settings.get("gating_model_path") or raw.get("gating_model_path") or "data/gating_model.pkl",
+            settings.get("gating_model_path")
+            or raw.get("gating_model_path")
+            or "data/gating_model.pkl",
             base=path.parent,
         ),
         "constitution_restricted": str(
@@ -71,10 +98,77 @@ def _load_config_sync(path: Path) -> dict[str, Any]:
         "mcp_servers": _normalize_mcp_servers(raw.get("mcp_servers")),
         "interface_keys": dict(raw.get("interface_keys") or {}),
         "freellmapi": list(raw.get("freellmapi") or []),
-        "evolution_time_range": _normalize_time_range(raw.get("evolution_time_range"), settings),
-        "max_concurrent_arms": int(raw.get("max_concurrent_arms") or settings.get("max_concurrent_arms") or 10),
+        "evolution_time_range": _normalize_time_range(
+            raw.get("evolution_time_range"), settings
+        ),
+        "max_concurrent_arms": int(
+            raw.get("max_concurrent_arms") or settings.get("max_concurrent_arms") or 10
+        ),
+        "message_hub_start_listener": bool(
+            raw.get("message_hub_start_listener")
+            if raw.get("message_hub_start_listener") is not None
+            else settings.get("message_hub_start_listener", False)
+        ),
+        "allow_local_terminal_fallback": bool(
+            raw.get("allow_local_terminal_fallback")
+            if raw.get("allow_local_terminal_fallback") is not None
+            else settings.get("allow_local_terminal_fallback", False)
+        ),
+        "hybrid_brain_enabled": bool(
+            raw.get("hybrid_brain_enabled")
+            if raw.get("hybrid_brain_enabled") is not None
+            else settings.get("hybrid_brain_enabled", False)
+        ),
+        "hybrid_brain_stress_threshold": int(
+            raw.get("hybrid_brain_stress_threshold")
+            if raw.get("hybrid_brain_stress_threshold") is not None
+            else settings.get("hybrid_brain_stress_threshold", 4)
+        ),
+        "hybrid_brain_prompt_chars_threshold": int(
+            raw.get("hybrid_brain_prompt_chars_threshold")
+            if raw.get("hybrid_brain_prompt_chars_threshold") is not None
+            else settings.get("hybrid_brain_prompt_chars_threshold", 600)
+        ),
+        "hybrid_brain_race_window_ms": int(
+            raw.get("hybrid_brain_race_window_ms")
+            if raw.get("hybrid_brain_race_window_ms") is not None
+            else settings.get("hybrid_brain_race_window_ms", 250)
+        ),
+        "evolution_skill_autoload_limit": int(
+            raw.get("evolution_skill_autoload_limit")
+            if raw.get("evolution_skill_autoload_limit") is not None
+            else settings.get("evolution_skill_autoload_limit", 2)
+        ),
+        "admin_api_token": raw.get("admin_api_token")
+        or settings.get("admin_api_token"),
+        "autonomous_enabled": bool(
+            raw.get("autonomous_enabled")
+            if raw.get("autonomous_enabled") is not None
+            else settings.get("autonomous_enabled", False)
+        ),
+        "enable_unsafe_admin_endpoints": bool(
+            raw.get("enable_unsafe_admin_endpoints")
+            if raw.get("enable_unsafe_admin_endpoints") is not None
+            else settings.get("enable_unsafe_admin_endpoints", False)
+        ),
+        "telegram_allowed_user_ids": list(
+            raw.get("telegram_allowed_user_ids")
+            or settings.get("telegram_allowed_user_ids")
+            or []
+        ),
+        "slack_allowed_user_ids": list(
+            raw.get("slack_allowed_user_ids")
+            or settings.get("slack_allowed_user_ids")
+            or []
+        ),
+        "whatsapp_allowed_user_ids": list(
+            raw.get("whatsapp_allowed_user_ids")
+            or settings.get("whatsapp_allowed_user_ids")
+            or []
+        ),
         "sentry_dsn": raw.get("sentry_dsn") or settings.get("sentry_dsn"),
-        "sentry_environment": raw.get("sentry_environment") or settings.get("sentry_environment"),
+        "sentry_environment": raw.get("sentry_environment")
+        or settings.get("sentry_environment"),
         "sentry_release": raw.get("sentry_release") or settings.get("sentry_release"),
         "sentry_traces_sample_rate": float(
             raw.get("sentry_traces_sample_rate")

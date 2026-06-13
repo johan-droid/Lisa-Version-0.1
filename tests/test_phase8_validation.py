@@ -26,10 +26,13 @@ def test_memory_stays_under_1gb_during_concurrent_chat_requests(tmp_path: Path) 
     )
 
     with TestClient(create_app(settings)) as client:
-        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         with ThreadPoolExecutor(max_workers=10) as pool:
             futures = [
-                pool.submit(lambda: client.post("/chat", json={"message": "Hello, LISA?"}).status_code)
+                pool.submit(
+                    lambda: client.post(
+                        "/chat", json={"message": "Hello, LISA?"}
+                    ).status_code
+                )
                 for _ in range(10)
             ]
             statuses = [future.result(timeout=30) for future in futures]

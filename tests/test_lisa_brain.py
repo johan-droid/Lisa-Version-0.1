@@ -4,7 +4,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import lisa_brain
-from lisa.gating import PersonaGatingNetwork, train_persona_gating_network, write_synthetic_persona_training_csv
+from lisa.gating import (
+    PersonaGatingNetwork,
+    train_persona_gating_network,
+    write_synthetic_persona_training_csv,
+)
 from lisa.local_inference import PersonaGatedModel
 
 
@@ -15,7 +19,9 @@ def test_synthetic_gating_data_and_training_produce_blend(tmp_path: Path) -> Non
     rows = csv_path.read_text(encoding="utf-8").splitlines()
     assert len(rows) == 501
 
-    model = train_persona_gating_network(csv_path, max_features=500, hidden_size=64, seed=13)
+    model = train_persona_gating_network(
+        csv_path, max_features=500, hidden_size=64, seed=13
+    )
     blend = model.compute_blend("build a secure api endpoint and fix a bug")
 
     assert set(blend) == {
@@ -28,7 +34,9 @@ def test_synthetic_gating_data_and_training_produce_blend(tmp_path: Path) -> Non
     assert abs(sum(blend.values()) - 1.0) < 0.01
 
 
-def test_lisa_brain_cli_prints_blend_and_tool_calls(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_lisa_brain_cli_prints_blend_and_tool_calls(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
     class FakeLlama:
         def create_chat_completion(self, **kwargs):
             return {
@@ -37,7 +45,7 @@ def test_lisa_brain_cli_prints_blend_and_tool_calls(tmp_path: Path, monkeypatch,
                         "message": {
                             "content": (
                                 "Here is the helper.\n"
-                                "<tool_call>{\"name\":\"search_notepad\",\"arguments\":{\"query\":\"overflow\"}}</tool_call>\n"
+                                '<tool_call>{"name":"search_notepad","arguments":{"query":"overflow"}}</tool_call>\n'
                                 "Done."
                             )
                         }
@@ -45,7 +53,9 @@ def test_lisa_brain_cli_prints_blend_and_tool_calls(tmp_path: Path, monkeypatch,
                 ]
             }
 
-    monkeypatch.setattr(PersonaGatedModel, "_load_model", lambda self, model_path: FakeLlama())
+    monkeypatch.setattr(
+        PersonaGatedModel, "_load_model", lambda self, model_path: FakeLlama()
+    )
 
     settings = SimpleNamespace(
         prompt="Write a Python function to add two numbers and check for overflows",
@@ -63,7 +73,9 @@ def test_lisa_brain_cli_prints_blend_and_tool_calls(tmp_path: Path, monkeypatch,
     monkeypatch.setattr(
         lisa_brain,
         "_load_or_train_gating_model",
-        lambda csv_path, model_path, force_train: PersonaGatingNetwork.initialize(max_features=32, hidden_size=8, seed=4),
+        lambda csv_path, model_path, force_train: PersonaGatingNetwork.initialize(
+            max_features=32, hidden_size=8, seed=4
+        ),
     )
 
     lisa_brain.main()
