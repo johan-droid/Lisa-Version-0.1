@@ -64,7 +64,27 @@ def start_supervisor():
 
 
 def main():
+    os.makedirs("data", exist_ok=True)
+    pid_file = "data/telegram_bridge.pid"
+
+    # Try to write PID atomically
+    import fcntl
+    try:
+        pid_fd = open(pid_file, "w")
+        fcntl.flock(pid_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        pid_fd.write(str(os.getpid()))
+        pid_fd.flush()
+    except (IOError, BlockingIOError):
+        try:
+            with open(pid_file, "r") as f:
+                holding_pid = f.read().strip()
+        except IOError:
+            holding_pid = "unknown"
+        print(f"Cannot start Telegram bridge: already running (PID: {holding_pid}). Exiting.")
+        sys.exit(1)
+
     os.makedirs("logs", exist_ok=True)
+
     kill_existing_servers()
 
     # Start supervisor
@@ -136,8 +156,18 @@ def main():
                     f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
                     json={"drop_pending_updates": True},
                 )
+
+                # Exponential backoff for conflicts
+                conflict_retries = getattr(client, "_conflict_retries", 0) + 1
+                client._conflict_retries = conflict_retries
+                backoff = min(60, 2 ** conflict_retries)
+                log(f"Backing off for {backoff} seconds after conflict...")
+                time.sleep(backoff)
             else:
+                if hasattr(client, "_conflict_retries"):
+                    client._conflict_retries = 0
                 log(
+
                     f"Telegram API getUpdates returned status {resp.status_code}: {resp.text}"
                 )
 

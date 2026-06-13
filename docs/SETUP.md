@@ -48,7 +48,7 @@ Copy the env example file and verify your tokens:
 ```bash
 cp .env.example .env.local
 ```
-Open `.env.local` and customize the parameters (e.g. `LISA_BOT_SECURITY_KEY`, `LISA_TELEGRAM_BOT_TOKEN`).
+Open `.env.local` and customize the parameters (e.g. `LISA_ADMIN_API_TOKEN`, `LISA_TELEGRAM_BOT_TOKEN`).
 
 ### 6. Set Up Docker Sandboxing
 Ensure the Docker daemon is running, and pull the python slim image:
@@ -97,7 +97,7 @@ evolution:
 | Variable Name | Default Value | Purpose |
 |---|---|---|
 | `LISA_WORKSPACE_ROOT` | `.` | Root directory of the repository. |
-| `LISA_BOT_SECURITY_KEY` | *(generated)* | Gating key for Telegram/Slack channel pairing. |
+| `LISA_ADMIN_API_TOKEN` | *(generated)* | Gating key for Telegram/Slack channel pairing. |
 | `LISA_TELEGRAM_BOT_TOKEN` | `None` | Telegram HTTP API bot token. |
 | `LISA_SLACK_BOT_TOKEN` | `None` | Slack Web Client API bot token. |
 | `LISA_WHATSAPP_BOT_TOKEN` | `None` | WhatsApp cloud business gateway token. |

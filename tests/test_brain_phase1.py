@@ -51,8 +51,9 @@ def test_phase1_gating_bundle_is_loadable_by_runtime(tmp_path: Path) -> None:
     loaded = PersonaGatingNetwork.load(pkl_path)
     blend = loaded.compute_blend("build a secure api endpoint and fix the bug")
 
-    assert pkl_path.exists()
-    assert bundle.metadata()["format"] == "sklearn"
+    assert not pkl_path.exists()
+    assert pkl_path.with_suffix('.npz').exists()
+
     assert abs(sum(blend.values()) - 1.0) < 0.02
 
 

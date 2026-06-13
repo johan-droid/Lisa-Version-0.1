@@ -86,11 +86,28 @@ class ChannelAccessController:
             for source, user_ids in self._rules.items()
             if user_ids
         }
-        self.storage_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        # Atomic rename-under-lock
+        import tempfile
+        import os
+
+        # Create temp file in same directory to ensure rename is atomic
+        fd, temp_path = tempfile.mkstemp(dir=str(self.storage_path.parent), suffix=".tmp", prefix="channel_access_")
+        temp_file = Path(temp_path)
         try:
-            self.storage_path.chmod(0o600)
-        except OSError:
-            pass
+            with open(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            try:
+                temp_file.chmod(0o600)
+            except OSError:
+                pass
+            os.replace(temp_path, str(self.storage_path))
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
 
     @staticmethod
     def _normalize_ids(value: Any) -> list[str]:
