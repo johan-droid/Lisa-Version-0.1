@@ -57,19 +57,20 @@ def _weights_bytes(arrays: dict[str, np.ndarray]) -> bytes:
     return buffer.getvalue()
 
 
-def _artifact_signature(path: Path, metadata: dict[str, Any], weights_blob: bytes) -> str:
+def _artifact_signature(
+    path: Path, metadata: dict[str, Any], weights_blob: bytes
+) -> str:
     key = get_hmac_key(_signing_context(path))
     payload = _metadata_bytes(metadata) + b"\n" + weights_blob
     return hmac.new(key, payload, sha256).hexdigest()
 
 
-def _write_artifacts(path: Path, metadata: dict[str, Any], arrays: dict[str, np.ndarray]) -> None:
+def _write_artifacts(
+    path: Path, metadata: dict[str, Any], arrays: dict[str, np.ndarray]
+) -> None:
     metadata_path, weights_path, signature_path = _artifact_paths(path)
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    safe_arrays = {
-        name: np.asarray(array)
-        for name, array in arrays.items()
-    }
+    safe_arrays = {name: np.asarray(array) for name, array in arrays.items()}
     weights_blob = _weights_bytes(safe_arrays)
     metadata_path.write_text(
         json.dumps(metadata, indent=2, sort_keys=True),
@@ -84,7 +85,9 @@ def _write_artifacts(path: Path, metadata: dict[str, Any], arrays: dict[str, np.
 
 def _load_artifacts(path: Path) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     metadata_path, weights_path, signature_path = _artifact_paths(path)
-    if not (metadata_path.exists() and weights_path.exists() and signature_path.exists()):
+    if not (
+        metadata_path.exists() and weights_path.exists() and signature_path.exists()
+    ):
         raise FileNotFoundError(f"Signed gating artifacts are missing for {path}.")
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -158,7 +161,9 @@ class PersonaSklearnGatingBundle:
         cls, metadata: dict[str, Any], arrays: dict[str, np.ndarray]
     ) -> "PersonaSklearnGatingBundle":
         return cls(
-            vocabulary={str(key): int(value) for key, value in metadata["vocabulary"].items()},
+            vocabulary={
+                str(key): int(value) for key, value in metadata["vocabulary"].items()
+            },
             idf=np.asarray(arrays["idf"], dtype=np.float32),
             classes=tuple(str(item) for item in metadata["classes"]),
             hidden_weights=np.asarray(arrays["hidden_weights"], dtype=np.float32),
@@ -249,10 +254,13 @@ class PersonaSklearnGatingBundle:
         personas: tuple[str, ...],
         trained_at: str | None,
     ) -> "PersonaSklearnGatingBundle":
-        if len(getattr(classifier, "coefs_", [])) != 2 or len(
-            getattr(classifier, "intercepts_", [])
-        ) != 2:
-            raise ValueError("Only single-hidden-layer MLP gating bundles can be migrated safely.")
+        if (
+            len(getattr(classifier, "coefs_", [])) != 2
+            or len(getattr(classifier, "intercepts_", [])) != 2
+        ):
+            raise ValueError(
+                "Only single-hidden-layer MLP gating bundles can be migrated safely."
+            )
         activation = str(getattr(classifier, "activation", "tanh")).lower()
         if activation != "tanh":
             raise ValueError(f"Unsupported gating activation {activation!r}.")
@@ -472,7 +480,9 @@ class PersonaGatingNetwork:
         return {
             "format": "persona_network_v2",
             "encoder_max_features": int(self.encoder.max_features),
-            "vocabulary": {key: int(value) for key, value in self.encoder.vocabulary.items()},
+            "vocabulary": {
+                key: int(value) for key, value in self.encoder.vocabulary.items()
+            },
             "hidden_size": int(self.hidden_size),
             "personas": list(self.personas),
             "trained_at": self.trained_at,
@@ -617,7 +627,9 @@ class PersonaGatingNetwork:
     @classmethod
     def artifacts_exist(cls, path: Path) -> bool:
         metadata_path, weights_path, signature_path = _artifact_paths(Path(path))
-        return metadata_path.exists() and weights_path.exists() and signature_path.exists()
+        return (
+            metadata_path.exists() and weights_path.exists() and signature_path.exists()
+        )
 
     @classmethod
     def _migrate_legacy_pickle(cls, path: Path) -> "PersonaGatingNetwork":
@@ -631,7 +643,9 @@ class PersonaGatingNetwork:
             bundle = PersonaSklearnGatingBundle.from_legacy_objects(
                 state["vectorizer"],
                 state["classifier"],
-                tuple(state.get("personas") or tuple(persona.value for persona in Persona)),
+                tuple(
+                    state.get("personas") or tuple(persona.value for persona in Persona)
+                ),
                 state.get("trained_at"),
             )
             bundle.save(path)

@@ -123,7 +123,10 @@ def main():
                             }
                             try:
                                 fwd_resp = client.post(
-                                    WEBHOOK_URL, json=update, headers=headers, timeout=15.0
+                                    WEBHOOK_URL,
+                                    json=update,
+                                    headers=headers,
+                                    timeout=15.0,
                                 )
                                 log(
                                     f"Forward response status: {fwd_resp.status_code}, body: {fwd_resp.text}"

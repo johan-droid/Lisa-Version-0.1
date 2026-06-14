@@ -92,7 +92,9 @@ class SessionAuthManager:
         )
 
     def verify_websocket(self, websocket: WebSocket, *, scope: str) -> SessionRecord:
-        token = _extract_token(websocket.headers, websocket.cookies, websocket.query_params)
+        token = _extract_token(
+            websocket.headers, websocket.cookies, websocket.query_params
+        )
         return self._verify_token(
             token,
             scope=scope,
@@ -118,7 +120,9 @@ class SessionAuthManager:
             user_agent=user_agent,
         )
 
-    def attach_cookie(self, response: Response, token: str, record: SessionRecord) -> None:
+    def attach_cookie(
+        self, response: Response, token: str, record: SessionRecord
+    ) -> None:
         max_age = max(1, int((record.expires_at - _utcnow()).total_seconds()))
         response.set_cookie(
             key=SESSION_COOKIE_NAME,

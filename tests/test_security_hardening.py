@@ -38,7 +38,9 @@ def build_security_client(
     return TestClient(create_app(settings))
 
 
-def issue_dashboard_session(client: TestClient, credential: str = "test-admin-token") -> str:
+def issue_dashboard_session(
+    client: TestClient, credential: str = "test-admin-token"
+) -> str:
     response = client.post("/auth/session", json={"credential": credential})
     assert response.status_code == 200
     return response.json()["token"]
@@ -119,7 +121,9 @@ def test_personal_and_dashboard_websocket_require_session(tmp_path: Path) -> Non
 
         try:
             with client.websocket_connect("/ws/dashboard"):
-                raise AssertionError("websocket unexpectedly connected without a session")
+                raise AssertionError(
+                    "websocket unexpectedly connected without a session"
+                )
         except WebSocketDisconnect as exc:
             assert exc.code == 1008
 
@@ -130,13 +134,10 @@ def test_expired_dashboard_session_is_rejected(tmp_path: Path) -> None:
         record = client.app.state.session_auth._records[token.split(".", 1)[0]]
         record.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
 
-        response = client.get(
-            "/personal", headers={"X-Lisa-Session": token}
-        )
+        response = client.get("/personal", headers={"X-Lisa-Session": token})
         assert response.status_code == 401
         assert any(
-            word in response.json()["detail"].lower()
-            for word in ("expired", "unknown")
+            word in response.json()["detail"].lower() for word in ("expired", "unknown")
         )
 
 
@@ -170,7 +171,9 @@ def test_memory_audit_redacts_secret_payloads() -> None:
     asyncio.run(scenario())
 
 
-def test_gating_model_migrates_legacy_pickle_and_rejects_tampering(tmp_path: Path) -> None:
+def test_gating_model_migrates_legacy_pickle_and_rejects_tampering(
+    tmp_path: Path,
+) -> None:
     legacy_path = tmp_path / "data" / "gating_model.pkl"
     legacy_path.parent.mkdir(parents=True, exist_ok=True)
     model = PersonaGatingNetwork.initialize(max_features=32, hidden_size=8, seed=5)

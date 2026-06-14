@@ -31,7 +31,9 @@ def kill_existing_servers():
 
 async def poll_telegram():
     if not BOT_TOKEN:
-        raise RuntimeError("LISA_TELEGRAM_BOT_TOKEN must be set before running this helper.")
+        raise RuntimeError(
+            "LISA_TELEGRAM_BOT_TOKEN must be set before running this helper."
+        )
     print("Starting Telegram polling loop...")
     async with httpx.AsyncClient(timeout=10.0) as client:
         # First, let's delete any webhook just in case

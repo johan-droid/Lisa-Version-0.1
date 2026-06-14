@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import psutil
 
@@ -57,7 +57,7 @@ class ProcessLock:
                 "pid": os.getpid(),
                 "role": self.role,
                 "acquired_at": _utcnow(),
-                "command": " ".join(os.sys.argv),
+                "command": " ".join(sys.argv),
             }
             os.write(fd, json.dumps(payload, ensure_ascii=True).encode("utf-8"))
             os.close(fd)

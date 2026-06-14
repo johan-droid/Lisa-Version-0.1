@@ -236,9 +236,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.style_learner = style_learner
     app.state.wellness_tracker = wellness_tracker
 
-    if not notepad.search(
-        "evolution_goal_resolved safety/admin_auth.py", limit=1
-    ):
+    if not notepad.search("evolution_goal_resolved safety/admin_auth.py", limit=1):
         notepad.log_entry(
             entry_type="evolution_goal_resolved",
             payload={
@@ -1160,8 +1158,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/dashboard", response_model=list[DashboardMetric])
     async def dashboard(
-        request: Request,
-        limit: int = Query(default=20, ge=1, le=100)
+        request: Request, limit: int = Query(default=20, ge=1, le=100)
     ) -> list[DashboardMetric]:
         _require_dashboard_session(request)
         await runtime.notepad_writer.flush_pending()

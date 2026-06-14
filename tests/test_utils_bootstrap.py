@@ -56,7 +56,9 @@ def test_encrypted_api_key_round_trip(tmp_path: Path) -> None:
     assert payload["providers"]["openai"]["api_key"] == "secret"
 
 
-def test_snapshot_key_is_generated_persistently_when_not_configured(tmp_path: Path) -> None:
+def test_snapshot_key_is_generated_persistently_when_not_configured(
+    tmp_path: Path,
+) -> None:
     settings = SimpleNamespace(workspace_root=tmp_path, bot_security_key=None)
 
     first = get_hmac_key(settings)
