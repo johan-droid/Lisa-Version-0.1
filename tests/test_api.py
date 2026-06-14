@@ -618,7 +618,7 @@ def test_gating_model_persists_and_loads(tmp_path: Path) -> None:
     model = PersonaGatingNetwork.initialize(max_features=32, hidden_size=8, seed=4)
     model.save(path)
 
-    loaded = PersonaGatingNetwork.load(path)
+    loaded = PersonaGatingNetwork.load_or_initialize(path)
     prediction = loaded.predict_blend("build a secure api endpoint")
 
     assert set(prediction) == {

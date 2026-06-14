@@ -96,6 +96,7 @@ def monitor_lisa() -> None:
 
     # Try to write PID atomically
     import fcntl
+
     try:
         pid_fd = open(pid_file, "w")
         fcntl.flock(pid_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -107,7 +108,9 @@ def monitor_lisa() -> None:
                 holding_pid = f.read().strip()
         except IOError:
             holding_pid = "unknown"
-        logger.error(f"Cannot start supervisor: LISA is already running (PID: {holding_pid}). Exiting.")
+        logger.error(
+            f"Cannot start supervisor: LISA is already running (PID: {holding_pid}). Exiting."
+        )
         sys.exit(1)
 
     os.makedirs("logs", exist_ok=True)

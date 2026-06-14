@@ -1,3 +1,6 @@
+import uuid
+import datetime
+import json
 import sqlite3
 
 # This simulates what the notepad does internally for evolution_goals.
@@ -15,12 +18,18 @@ conn.execute("""
         created_at TEXT NOT NULL
     )
 """)
-import uuid
-import datetime
-import json
+
 conn.execute(
     "INSERT INTO agent_audit_events (id, component, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-    (str(uuid.uuid4()), "evolution_engine", "evolution_goal_resolved", json.dumps({"target": "safety/admin_auth.py", "reason": "Manually resolved via audit."}), datetime.datetime.now(datetime.timezone.utc).isoformat())
+    (
+        str(uuid.uuid4()),
+        "evolution_engine",
+        "evolution_goal_resolved",
+        json.dumps(
+            {"target": "safety/admin_auth.py", "reason": "Manually resolved via audit."}
+        ),
+        datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    ),
 )
 conn.commit()
 conn.close()

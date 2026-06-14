@@ -69,6 +69,7 @@ def main():
 
     # Try to write PID atomically
     import fcntl
+
     try:
         pid_fd = open(pid_file, "w")
         fcntl.flock(pid_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -80,7 +81,9 @@ def main():
                 holding_pid = f.read().strip()
         except IOError:
             holding_pid = "unknown"
-        print(f"Cannot start Telegram bridge: already running (PID: {holding_pid}). Exiting.")
+        print(
+            f"Cannot start Telegram bridge: already running (PID: {holding_pid}). Exiting."
+        )
         sys.exit(1)
 
     os.makedirs("logs", exist_ok=True)
@@ -160,14 +163,13 @@ def main():
                 # Exponential backoff for conflicts
                 conflict_retries = getattr(client, "_conflict_retries", 0) + 1
                 client._conflict_retries = conflict_retries
-                backoff = min(60, 2 ** conflict_retries)
+                backoff = min(60, 2**conflict_retries)
                 log(f"Backing off for {backoff} seconds after conflict...")
                 time.sleep(backoff)
             else:
                 if hasattr(client, "_conflict_retries"):
                     client._conflict_retries = 0
                 log(
-
                     f"Telegram API getUpdates returned status {resp.status_code}: {resp.text}"
                 )
 

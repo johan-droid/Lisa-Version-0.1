@@ -7,6 +7,7 @@ import asyncio
 import json
 import uuid
 import time
+import traceback
 from typing import Any
 import httpx
 from time import perf_counter
@@ -66,14 +67,14 @@ LOGGER = logging.getLogger("lisa.api")
 
 
 
-from fastapi.responses import JSONResponse
-import traceback
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     event_bus = EventBus()
 
-    app = FastAPI(title=settings.app_name, version="1.0.0", docs_url=None, redoc_url=None)
+    app = FastAPI(
+        title=settings.app_name, version="1.0.0", docs_url=None, redoc_url=None
+    )
 
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):
@@ -81,7 +82,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         LOGGER.error(traceback.format_exc())
         return JSONResponse(
             status_code=500,
-            content={"error": "Internal Server Error", "detail": str(exc)}
+            content={"error": "Internal Server Error", "detail": str(exc)},
         )
 
     memory = HybridMemoryCoordinator(

@@ -323,7 +323,7 @@ def main() -> None:
     # Try to write PID atomically
     import fcntl
     import sys
-    import logging
+
     try:
         pid_fd = open(pid_file, "w")
         fcntl.flock(pid_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -335,7 +335,10 @@ def main() -> None:
                 holding_pid = f.read().strip()
         except IOError:
             holding_pid = "unknown"
-        print(f"Cannot start LISA main: already running (PID: {holding_pid}). Exiting.", file=sys.stderr)
+        print(
+            f"Cannot start LISA main: already running (PID: {holding_pid}). Exiting.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     args = parse_args()

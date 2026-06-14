@@ -92,7 +92,9 @@ class ChannelAccessController:
         import os
 
         # Create temp file in same directory to ensure rename is atomic
-        fd, temp_path = tempfile.mkstemp(dir=str(self.storage_path.parent), suffix=".tmp", prefix="channel_access_")
+        fd, temp_path = tempfile.mkstemp(
+            dir=str(self.storage_path.parent), suffix=".tmp", prefix="channel_access_"
+        )
         temp_file = Path(temp_path)
         try:
             with open(fd, "w", encoding="utf-8") as f:

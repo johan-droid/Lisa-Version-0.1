@@ -21,7 +21,9 @@ def extract_admin_token(headers: Any) -> str | None:
     return None
 
 
-def require_admin_request(request: Request, settings: Any, unsafe_only: bool = False) -> None:
+def require_admin_request(
+    request: Request, settings: Any, unsafe_only: bool = False
+) -> None:
     expected = getattr(settings, "admin_api_token", None)
     if not expected:
         raise HTTPException(
@@ -33,4 +35,6 @@ def require_admin_request(request: Request, settings: Any, unsafe_only: bool = F
         raise HTTPException(status_code=403, detail="Admin authorization failed.")
 
     if unsafe_only and not getattr(settings, "enable_unsafe_admin_endpoints", False):
-        raise HTTPException(status_code=403, detail="Unsafe admin endpoints are disabled.")
+        raise HTTPException(
+            status_code=403, detail="Unsafe admin endpoints are disabled."
+        )
