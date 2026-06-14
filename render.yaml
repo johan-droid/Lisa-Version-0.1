@@ -9,6 +9,8 @@ services:
     envVars:
       - key: HOST
         value: 0.0.0.0
+      - key: LISA_ALLOW_REMOTE_BIND
+        value: "true"
       - key: LISA_REQUIRE_LOCAL_MODEL
         value: "false"
       - key: LISA_REQUIRE_DOCKER

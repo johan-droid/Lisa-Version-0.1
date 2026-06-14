@@ -26,6 +26,7 @@ def build_settings(tmp_path: Path) -> Settings:
         model_name="gpt-4o-mini",
         model_base_url="https://example.invalid",
         model_api_key="test-key",
+        admin_api_token="test-admin-token",
     )
 
 
@@ -93,6 +94,8 @@ def test_full_chat_pipeline_with_mocked_external_model(
     app = create_app(settings)
 
     with TestClient(app) as client:
+        auth = client.post("/auth/session", json={"credential": "test-admin-token"})
+        assert auth.status_code == 200
         response = client.post("/chat", json={"message": "Hello, LISA?"})
 
         assert response.status_code == 200

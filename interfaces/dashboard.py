@@ -127,6 +127,37 @@ def render_dashboard_html(
     .chart-box {{
       height: 360px;
     }}
+    .auth-panel {{
+      margin-bottom: 18px;
+      padding: 16px;
+      border-radius: 18px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
+    }}
+    .auth-panel form {{
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }}
+    .auth-panel input {{
+      flex: 1 1 280px;
+      min-width: 220px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(8, 17, 31, 0.75);
+      color: var(--text);
+      padding: 12px 14px;
+    }}
+    .auth-panel button {{
+      border: 0;
+      border-radius: 12px;
+      padding: 12px 16px;
+      background: linear-gradient(135deg, #6fd5ff, #90f0b6);
+      color: #04111d;
+      font-weight: 700;
+      cursor: pointer;
+    }}
     canvas {{ width: 100% !important; height: 100% !important; }}
     @media (max-width: 900px) {{
       .grid, .panels {{ grid-template-columns: 1fr; }}
@@ -143,6 +174,14 @@ def render_dashboard_html(
       </div>
       <div class="status" id="hubStatus">Connecting...</div>
     </header>
+    <div class="auth-panel" id="authPanel" hidden>
+      <div class="metric-label">Session Authentication Required</div>
+      <div class="metric-detail" id="authStatus">Enter the current admin token or bot security key to mint a short-lived dashboard session.</div>
+      <form id="authForm">
+        <input id="authCredential" type="password" autocomplete="current-password" placeholder="Admin token or bot security key" />
+        <button type="submit">Unlock Dashboard</button>
+      </form>
+    </div>
       <div class="grid">
       <div class="card"><div class="metric-label">Active Tasks</div><div class="metric-value" id="activeTasks">0</div></div>
       <div class="card"><div class="metric-label">Token Consumption</div><div class="metric-value" id="tokens">0</div></div>
@@ -190,10 +229,15 @@ def render_dashboard_html(
     const personalSummaryNode = document.getElementById("personalSummary");
     const alertBannerNode = document.getElementById("alertBanner");
     const statusTableNode = document.getElementById("statusTable");
+    const authPanelNode = document.getElementById("authPanel");
+    const authStatusNode = document.getElementById("authStatus");
+    const authFormNode = document.getElementById("authForm");
+    const authCredentialNode = document.getElementById("authCredential");
     const timelineCtx = document.getElementById("timelineChart");
     const personaCtx = document.getElementById("personaChart");
     let timelineChart;
     let personaChart;
+    let reconnectTimer;
 
     function connect() {{
       const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -203,14 +247,49 @@ def render_dashboard_html(
       // Legacy endpoint kept for compatibility with older deployments: ${{legacySocketPath}}
       socket.addEventListener("open", () => {{
         statusNode.textContent = "Live";
+        authPanelNode.hidden = true;
       }});
       socket.addEventListener("close", () => {{
-        statusNode.textContent = "Reconnecting...";
-        setTimeout(connect, 1500);
+        statusNode.textContent = "Session required";
+        promptForSession("Your dashboard session expired or was rejected. Re-authenticate to reconnect.");
       }});
       socket.addEventListener("message", (event) => {{
         updateDashboard(JSON.parse(event.data));
       }});
+    }}
+
+    async function requestSession(credential) {{
+      const response = await fetch("/auth/session", {{
+        method: "POST",
+        headers: {{
+          "Content-Type": "application/json",
+        }},
+        body: JSON.stringify({{ credential }}),
+      }});
+      if (!response.ok) {{
+        const body = await response.json().catch(() => ({{ detail: "Authentication failed." }}));
+        throw new Error(body.detail || "Authentication failed.");
+      }}
+      return response.json();
+    }}
+
+    async function probeSession() {{
+      const response = await fetch("/dashboard/snapshot", {{ credentials: "same-origin" }});
+      if (response.ok) {{
+        updateDashboard(await response.json());
+        connect();
+        return true;
+      }}
+      return false;
+    }}
+
+    function promptForSession(message) {{
+      if (reconnectTimer) {{
+        clearTimeout(reconnectTimer);
+        reconnectTimer = undefined;
+      }}
+      authPanelNode.hidden = false;
+      authStatusNode.textContent = message;
     }}
 
     function ensureCharts(snapshot) {{
@@ -309,7 +388,30 @@ def render_dashboard_html(
       ensureCharts(snapshot);
     }}
 
-    connect();
+    authFormNode.addEventListener("submit", async (event) => {{
+      event.preventDefault();
+      const credential = authCredentialNode.value.trim();
+      if (!credential) {{
+        promptForSession("Enter the admin token or bot security key to continue.");
+        return;
+      }}
+      authStatusNode.textContent = "Issuing short-lived session...";
+      try {{
+        await requestSession(credential);
+        authCredentialNode.value = "";
+        authStatusNode.textContent = "Authenticated. Connecting...";
+        authPanelNode.hidden = true;
+        connect();
+      }} catch (error) {{
+        promptForSession(error.message || "Authentication failed.");
+      }}
+    }});
+
+    probeSession().then((authenticated) => {{
+      if (!authenticated) {{
+        promptForSession("Enter the current admin token or bot security key to mint a short-lived dashboard session.");
+      }}
+    }});
   </script>
 </body>
 </html>"""

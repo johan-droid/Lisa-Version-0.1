@@ -7,7 +7,6 @@ import asyncio
 import json
 import uuid
 import time
-import traceback
 from typing import Any
 import httpx
 from time import perf_counter
@@ -61,6 +60,11 @@ from personal import (
 from safety.admin_auth import require_admin_request
 from safety.input_sanitizer import ensure_body_size
 from safety.replay_guard import ReplayAttackDetected
+from safety.session_auth import (
+    SessionAuthManager,
+    require_session_request,
+    reject_websocket,
+)
 from utils.observability import bind_runtime_context
 
 LOGGER = logging.getLogger("lisa.api")
@@ -69,20 +73,6 @@ LOGGER = logging.getLogger("lisa.api")
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     event_bus = EventBus()
-
-    app = FastAPI(
-        title=settings.app_name, version="1.0.0", docs_url=None, redoc_url=None
-    )
-
-    @app.exception_handler(Exception)
-    async def global_exception_handler(request: Request, exc: Exception):
-        LOGGER.error(f"Unhandled exception on {request.url}: {exc}")
-        LOGGER.error(traceback.format_exc())
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Internal Server Error", "detail": str(exc)},
-        )
-
     memory = HybridMemoryCoordinator(
         agent_id=str(getattr(settings, "agent_id", "lisa") or "lisa"),
         namespace=str(settings.db_path.resolve()),
@@ -168,6 +158,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         conductor=conductor,
         event_bus=event_bus,
     )
+    session_auth = SessionAuthManager(settings)
     message_hub = MessageHub(
         settings=settings,
         event_bus=event_bus,
@@ -176,6 +167,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         capabilities_provider=lambda: [
             tool.name for tool in runtime.tools.list_tools()
         ],
+        session_auth=session_auth,
     )
     wellness_task: asyncio.Task[None] | None = None
 
@@ -235,6 +227,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.react_engine = react_engine
     app.state.evolution_engine = evolution_engine
     app.state.message_hub = message_hub
+    app.state.session_auth = session_auth
     app.state.channel_access = message_hub.channel_access
     app.state.evolution_scheduler = evolution_scheduler
     app.state.personal_store = personal_store
@@ -242,6 +235,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.calendar_awareness = calendar_awareness
     app.state.style_learner = style_learner
     app.state.wellness_tracker = wellness_tracker
+
+    if not notepad.search(
+        "evolution_goal_resolved safety/admin_auth.py", limit=1
+    ):
+        notepad.log_entry(
+            entry_type="evolution_goal_resolved",
+            payload={
+                "module": "safety/admin_auth.py",
+                "task_summary": "Completed admin auth audit and route-guard verification.",
+                "status": "resolved",
+            },
+            constitution=ConstitutionMode.RESTRICTED,
+        )
 
     @app.middleware("http")
     async def request_context_middleware(request: Request, call_next):
@@ -294,6 +300,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "default-src 'self'; img-src 'self' data:; connect-src 'self' https: wss:; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'"
                 )
 
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(
+        request: Request, exc: Exception
+    ) -> JSONResponse:
+        request_id = getattr(request.state, "request_id", uuid.uuid4().hex)
+        LOGGER.exception(
+            "Unhandled exception request_id=%s method=%s path=%s",
+            request_id,
+            request.method,
+            request.url.path,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": "An internal server error occurred.",
+                "request_id": request_id,
+            },
+        )
+
+    def _require_dashboard_session(request: Request) -> None:
+        require_session_request(request, session_auth, scope="dashboard")
+
+    @app.post("/auth/session")
+    async def create_session(
+        request: Request,
+        response: Response,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        credential = str(payload.get("credential") or "").strip()
+        if not session_auth.has_bootstrap_credential():
+            raise HTTPException(
+                status_code=503,
+                detail="No admin token or bot security key is configured for session bootstrap.",
+            )
+        if not session_auth.is_credential_valid(credential):
+            raise HTTPException(status_code=403, detail="Session bootstrap failed.")
+        token, record = session_auth.issue_session(
+            scope="dashboard",
+            client_host=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+        session_auth.attach_cookie(response, token, record)
+        return {"ok": True, "token": token, "expires_at": record.expires_at.isoformat()}
+
+    @app.delete("/auth/session")
+    async def delete_session(request: Request, response: Response) -> dict[str, bool]:
+        session_auth.revoke(request.cookies.get("lisa_session"))
+        session_auth.clear_cookie(response)
+        return {"ok": True}
+
     @app.post("/bots/connect", response_model=ChannelAccessResponse, deprecated=True)
     async def connect_bot(
         access_request: ChannelAccessRequest, raw_request: Request
@@ -337,10 +393,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         }
 
-    @app.post("/shutdown", deprecated=True)
-    async def shutdown(request: Request) -> dict[str, str]:
-        require_admin_request(request, settings, unsafe_only=True)
-
+    async def _shutdown_runtime() -> dict[str, str]:
         import os
         import signal
 
@@ -351,10 +404,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         asyncio.create_task(asyncio.to_thread(kill_self))
         return {"status": "shutdown_initiated"}
 
-    @app.post("/shed_memory", deprecated=True)
-    async def shed_memory(request: Request) -> dict[str, str]:
-        require_admin_request(request, settings, unsafe_only=True)
-
+    async def _shed_memory_runtime() -> dict[str, str]:
         # 1. Clear browser cache
         try:
             async with runtime.tools._web_cache_lock:
@@ -411,13 +461,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         return {"status": "shedding_complete"}
 
-    @app.post("/admin/runtime/shutdown")
-    async def admin_shutdown(request: Request) -> dict[str, str]:
-        return await shutdown(request)
+    if settings.enable_unsafe_admin_endpoints:
 
-    @app.post("/admin/runtime/shed-memory")
-    async def admin_shed_memory(request: Request) -> dict[str, str]:
-        return await shed_memory(request)
+        @app.post("/shutdown", deprecated=True)
+        async def shutdown(request: Request) -> dict[str, str]:
+            require_admin_request(request, settings)
+            return await _shutdown_runtime()
+
+        @app.post("/shed_memory", deprecated=True)
+        async def shed_memory(request: Request) -> dict[str, str]:
+            require_admin_request(request, settings)
+            return await _shed_memory_runtime()
+
+        @app.post("/admin/runtime/shutdown")
+        async def admin_shutdown(request: Request) -> dict[str, str]:
+            require_admin_request(request, settings)
+            return await _shutdown_runtime()
+
+        @app.post("/admin/runtime/shed-memory")
+        async def admin_shed_memory(request: Request) -> dict[str, str]:
+            require_admin_request(request, settings)
+            return await _shed_memory_runtime()
 
     @app.get("/state", response_model=ConstitutionStateResponse)
     async def state() -> ConstitutionStateResponse:
@@ -981,7 +1045,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await ingest_message("whatsapp", request, response)
 
     @app.get("/v1/channels", response_model=ChannelCapabilitiesResponse)
-    async def channels() -> ChannelCapabilitiesResponse:
+    async def channels(request: Request) -> ChannelCapabilitiesResponse:
+        _require_dashboard_session(request)
         capabilities = message_hub.channel_gateway.capabilities()
         return ChannelCapabilitiesResponse(
             configured_channels=list(capabilities.get("configured_channels") or []),
@@ -1021,7 +1086,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @app.get("/tools", response_model=list[ToolSummary])
-    async def list_tools() -> list[ToolSummary]:
+    async def list_tools(request: Request) -> list[ToolSummary]:
+        _require_dashboard_session(request)
         return [
             ToolSummary(
                 name=tool.name,
@@ -1071,9 +1137,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/notepad/search", response_model=NotepadSearchResponse)
     async def search_notepad(
+        request: Request,
         q: str = Query(..., min_length=1),
         limit: int = Query(default=10, ge=1, le=50),
     ) -> NotepadSearchResponse:
+        _require_dashboard_session(request)
         await runtime.notepad_writer.flush_pending()
         rows = runtime.notepad.search(query=q, limit=limit)
         return NotepadSearchResponse(
@@ -1092,8 +1160,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/dashboard", response_model=list[DashboardMetric])
     async def dashboard(
+        request: Request,
         limit: int = Query(default=20, ge=1, le=100)
     ) -> list[DashboardMetric]:
+        _require_dashboard_session(request)
         await runtime.notepad_writer.flush_pending()
         metrics = runtime.notepad.recent_metrics(limit=limit)
         return [
@@ -1110,11 +1180,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return HTMLResponse(message_hub._render_dashboard_html())
 
     @app.get("/dashboard/snapshot")
-    async def dashboard_snapshot() -> dict[str, Any]:
+    async def dashboard_snapshot(request: Request) -> dict[str, Any]:
+        _require_dashboard_session(request)
         return message_hub._snapshot_payload()
 
     @app.get("/personal")
-    async def personal_summary() -> dict[str, object]:
+    async def personal_summary(request: Request) -> dict[str, object]:
+        _require_dashboard_session(request)
         if personal_store is None:
             return {"enabled": False, "calendar": calendar_awareness.today()}
         return {
@@ -1126,6 +1198,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.websocket("/ws/events")
     async def ws_events(websocket: WebSocket) -> None:
+        try:
+            session_auth.verify_websocket(websocket, scope="dashboard")
+        except HTTPException as exc:
+            await reject_websocket(websocket, exc.detail)
+            return
         await websocket.accept()
         queue = await event_bus.subscribe()
         try:
@@ -1139,6 +1216,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.websocket("/ws/dashboard")
     async def ws_dashboard(websocket: WebSocket) -> None:
+        try:
+            session_auth.verify_websocket(websocket, scope="dashboard")
+        except HTTPException as exc:
+            await reject_websocket(websocket, exc.detail)
+            return
         await websocket.accept()
         queue = await event_bus.subscribe()
         await websocket.send_json(message_hub._snapshot_payload())

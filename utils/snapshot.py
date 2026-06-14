@@ -3,6 +3,7 @@ import pickle
 import hmac
 import hashlib
 import logging
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -17,12 +18,34 @@ def get_snapshot_path(settings: Any) -> Path:
     return Path("data/lisa_state.snap")
 
 
+def get_snapshot_key_path(settings: Any) -> Path:
+    root = getattr(settings, "workspace_root", None)
+    if root:
+        return Path(root) / "data" / ".snapshot.key"
+    return Path("data/.snapshot.key")
+
+
+def _load_or_create_snapshot_key(settings: Any) -> bytes:
+    key_path = get_snapshot_key_path(settings)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    if key_path.exists():
+        return key_path.read_bytes().strip()
+
+    key = secrets.token_urlsafe(48).encode("utf-8")
+    key_path.write_bytes(key)
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
+    return key
+
+
 def get_hmac_key(settings: Any) -> bytes:
-    # Use bot_security_key if available, fallback to a persistent key or random bytes
+    # Use bot_security_key if available, otherwise load a workspace-local persistent secret.
     key_str = getattr(settings, "bot_security_key", None)
     if key_str:
         return key_str.encode("utf-8")
-    return b"lisa_default_secret_key_change_me_or_set_security_key"
+    return _load_or_create_snapshot_key(settings)
 
 
 def save_snapshot(state_data: Any, settings: Any) -> bool:

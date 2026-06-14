@@ -26,6 +26,7 @@ from interfaces.dashboard import render_dashboard_html
 from personal.context_store import PersonalContextStore
 from safety.input_sanitizer import ensure_body_size, sanitize_structure
 from safety.replay_guard import ReplayAttackDetected, ReplayGuard
+from safety.session_auth import SessionAuthManager
 from safety.webhooks import secrets_from_mapping, verify_webhook
 
 
@@ -165,6 +166,7 @@ class MessageHub:
         personal_store: PersonalContextStore | None = None,
         capabilities_provider: Callable[[], list[str]] | None = None,
         channel_gateway: ChannelGateway | None = None,
+        session_auth: SessionAuthManager | None = None,
     ):
         self.settings = settings
         self.event_bus = event_bus
@@ -223,6 +225,7 @@ class MessageHub:
         mapping["telegram_bot_token"] = getattr(settings, "telegram_bot_token", None)
         self.webhook_secrets = secrets_from_mapping(mapping)
         self.capabilities_provider = capabilities_provider
+        self.session_auth = session_auth
         self.channel_access = ChannelAccessController(
             self.settings.workspace_root / "data" / "channel_access.json",
             initial={
@@ -824,6 +827,13 @@ class MessageHub:
             )
 
     async def _dashboard_data(self, request: web.Request) -> web.Response:
+        if self.session_auth is not None:
+            try:
+                self.session_auth.verify_aiohttp_request(request, scope="dashboard")
+            except Exception as exc:
+                detail = getattr(exc, "detail", "Session token is required.")
+                status_code = int(getattr(exc, "status_code", 401))
+                return web.json_response({"detail": detail}, status=status_code)
         return web.json_response(self._snapshot_payload())
 
     async def _health(self, request: web.Request) -> web.Response:
@@ -850,6 +860,13 @@ class MessageHub:
         return web.Response(text=html, content_type="text/html")
 
     async def _dashboard_ws(self, request: web.Request) -> web.WebSocketResponse:
+        if self.session_auth is not None:
+            try:
+                self.session_auth.verify_aiohttp_request(request, scope="dashboard")
+            except Exception as exc:
+                detail = getattr(exc, "detail", "Session token is required.")
+                status_code = int(getattr(exc, "status_code", 401))
+                return web.json_response({"detail": detail}, status=status_code)
         websocket = web.WebSocketResponse(heartbeat=30.0)
         await websocket.prepare(request)
 

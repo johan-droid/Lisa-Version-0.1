@@ -6,7 +6,7 @@ import httpx
 import psutil
 import asyncio
 
-BOT_TOKEN = "8746921085:AAFFPTIWpYdiU3TOUkVA0-7Y5ke0XCVDa-I"
+BOT_TOKEN = os.environ.get("LISA_TELEGRAM_BOT_TOKEN", "").strip()
 
 
 def kill_existing_servers():
@@ -30,6 +30,8 @@ def kill_existing_servers():
 
 
 async def poll_telegram():
+    if not BOT_TOKEN:
+        raise RuntimeError("LISA_TELEGRAM_BOT_TOKEN must be set before running this helper.")
     print("Starting Telegram polling loop...")
     async with httpx.AsyncClient(timeout=10.0) as client:
         # First, let's delete any webhook just in case

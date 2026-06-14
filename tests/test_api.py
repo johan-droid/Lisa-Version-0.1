@@ -47,7 +47,10 @@ def build_client(tmp_path: Path, queue_size: int = 16) -> TestClient:
         admin_api_token="test-admin-token",
     )
     app = create_app(settings)
-    return TestClient(app)
+    client = TestClient(app)
+    auth = client.post("/auth/session", json={"credential": "test-admin-token"})
+    assert auth.status_code == 200
+    return client
 
 
 class StubToolExecutor:

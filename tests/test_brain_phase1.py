@@ -44,16 +44,17 @@ def test_phase1_gating_bundle_is_loadable_by_runtime(tmp_path: Path) -> None:
     pkl_path = tmp_path / "gating_model.pkl"
 
     write_persona_training_csv(csv_path, count=24, seed=5)
-    train_gating_bundle(
+    bundle = train_gating_bundle(
         csv_path, pkl_path, max_features=64, hidden_layer_size=8, seed=5
     )
 
     loaded = PersonaGatingNetwork.load(pkl_path)
     blend = loaded.compute_blend("build a secure api endpoint and fix the bug")
 
-    assert not pkl_path.exists()
+    assert pkl_path.with_suffix(".json").exists()
     assert pkl_path.with_suffix(".npz").exists()
-
+    assert pkl_path.with_suffix(".sig").exists()
+    assert bundle.metadata()["format"] == "sklearn"
     assert abs(sum(blend.values()) - 1.0) < 0.02
 
 

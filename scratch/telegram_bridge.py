@@ -4,7 +4,10 @@ import time
 import subprocess
 import httpx
 import psutil
+from pathlib import Path
 from dotenv import load_dotenv
+
+from utils.process_lock import ProcessLock, ProcessLockHeldError
 
 load_dotenv(".env.local")
 BOT_TOKEN = os.environ.get("LISA_TELEGRAM_BOT_TOKEN", "")
@@ -16,6 +19,9 @@ WEBHOOK_SECRET = os.environ.get("LISA_TELEGRAM_WEBHOOK_SECRET", BOT_TOKEN)
 
 WEBHOOK_URL = "http://127.0.0.1:8800/telegram/webhook"
 LOG_FILE = "logs/telegram_poll.log"
+LOCK_PATH = Path("data") / "locks" / "telegram_bridge.lock"
+MAX_WEBHOOK_DELETE_FAILURES = 5
+MAX_BACKOFF_SECONDS = 60
 
 
 def log(msg):
@@ -64,119 +70,100 @@ def start_supervisor():
 
 
 def main():
-    os.makedirs("data", exist_ok=True)
-    pid_file = "data/telegram_bridge.pid"
-
-    # Try to write PID atomically
-    import fcntl
-
-    try:
-        pid_fd = open(pid_file, "w")
-        fcntl.flock(pid_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        pid_fd.write(str(os.getpid()))
-        pid_fd.flush()
-    except (IOError, BlockingIOError):
-        try:
-            with open(pid_file, "r") as f:
-                holding_pid = f.read().strip()
-        except IOError:
-            holding_pid = "unknown"
-        print(
-            f"Cannot start Telegram bridge: already running (PID: {holding_pid}). Exiting."
-        )
-        sys.exit(1)
-
     os.makedirs("logs", exist_ok=True)
-
-    kill_existing_servers()
-
-    # Start supervisor
-    proc = start_supervisor()
-
-    # Wait for LISA to initialize
-    log("Waiting for LISA to initialize...")
-    time.sleep(8)
-
-    log("Starting Telegram Polling & Webhook Forwarding Bridge...")
-
-    # Delete webhook on telegram to enable getUpdates
+    lock = ProcessLock(LOCK_PATH, role="telegram-bridge")
     try:
-        r = httpx.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
-            json={"drop_pending_updates": True},
-        )
-        log(f"Delete Telegram Webhook response: {r.json()}")
-    except Exception as e:
-        log(f"Error deleting Telegram webhook: {e}")
+        lock.acquire()
+    except ProcessLockHeldError as exc:
+        holder = exc.holder
+        if holder is not None and holder.pid is not None:
+            log(
+                f"Telegram bridge lock is already held by PID {holder.pid}. Refusing to start a second bridge."
+            )
+        else:
+            log("Telegram bridge lock is already held. Refusing to start.")
+        sys.exit(1)
+    kill_existing_servers()
+    try:
+        proc = start_supervisor()
+        log("Waiting for LISA to initialize...")
+        time.sleep(8)
 
-    offset = 0
-    client = httpx.Client(timeout=10.0)
+        log("Starting Telegram Polling & Webhook Forwarding Bridge...")
 
-    while True:
-        try:
-            # Check if supervisor process is still alive
-            if proc.poll() is not None:
-                log("Supervisor process exited. Restarting supervisor...")
-                proc = start_supervisor()
-                time.sleep(8)
+        offset = 0
+        client = httpx.Client(timeout=10.0)
+        conflict_failures = 0
+        backoff_seconds = 1
 
-            # Poll Telegram Updates
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=5"
-            resp = client.get(url)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("ok") and data.get("result"):
-                    for update in data["result"]:
-                        update_id = update["update_id"]
-                        offset = max(offset, update_id + 1)
+        while True:
+            try:
+                if proc.poll() is not None:
+                    log("Supervisor process exited. Restarting supervisor...")
+                    proc = start_supervisor()
+                    time.sleep(8)
 
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=5"
+                resp = client.get(url)
+                if resp.status_code == 200:
+                    conflict_failures = 0
+                    backoff_seconds = 1
+                    data = resp.json()
+                    if data.get("ok") and data.get("result"):
+                        for update in data["result"]:
+                            update_id = update["update_id"]
+                            offset = max(offset, update_id + 1)
+
+                            log(
+                                f"Received update {update_id} from Telegram. Forwarding to local MessageHub..."
+                            )
+                            headers = {
+                                "X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET,
+                                "Content-Type": "application/json",
+                            }
+                            try:
+                                fwd_resp = client.post(
+                                    WEBHOOK_URL, json=update, headers=headers, timeout=15.0
+                                )
+                                log(
+                                    f"Forward response status: {fwd_resp.status_code}, body: {fwd_resp.text}"
+                                )
+                            except Exception as fwd_err:
+                                log(
+                                    f"Failed to forward update to local MessageHub: {fwd_err}"
+                                )
+                elif resp.status_code == 409:
+                    conflict_failures += 1
+                    if conflict_failures > MAX_WEBHOOK_DELETE_FAILURES:
                         log(
-                            f"Received update {update_id} from Telegram. Forwarding to local MessageHub..."
+                            "Circuit breaker opened after repeated Telegram webhook conflicts. Stopping bridge instead of retry storming."
                         )
+                        sys.exit(1)
+                    log(
+                        f"Conflict: Telegram Webhook might still be active. Deleting webhook with backoff {backoff_seconds}s (attempt {conflict_failures})."
+                    )
+                    try:
+                        delete_resp = client.post(
+                            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+                            json={"drop_pending_updates": True},
+                        )
+                        log(f"Delete Telegram Webhook response: {delete_resp.text}")
+                    except Exception as delete_err:
+                        log(f"Error deleting Telegram webhook: {delete_err}")
+                    time.sleep(backoff_seconds)
+                    backoff_seconds = min(MAX_BACKOFF_SECONDS, backoff_seconds * 2)
+                    continue
+                else:
+                    log(
+                        f"Telegram API getUpdates returned status {resp.status_code}: {resp.text}"
+                    )
 
-                        # Forward to local webhook
-                        headers = {
-                            "X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET,
-                            "Content-Type": "application/json",
-                        }
+            except Exception as e:
+                log(f"Error in main polling loop: {e}")
 
-                        try:
-                            fwd_resp = client.post(
-                                WEBHOOK_URL, json=update, headers=headers, timeout=15.0
-                            )
-                            log(
-                                f"Forward response status: {fwd_resp.status_code}, body: {fwd_resp.text}"
-                            )
-                        except Exception as fwd_err:
-                            log(
-                                f"Failed to forward update to local MessageHub: {fwd_err}"
-                            )
-            elif resp.status_code == 409:
-                log(
-                    "Conflict: Telegram Webhook might still be active. Attempting to delete webhook again..."
-                )
-                client.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
-                    json={"drop_pending_updates": True},
-                )
-
-                # Exponential backoff for conflicts
-                conflict_retries = getattr(client, "_conflict_retries", 0) + 1
-                client._conflict_retries = conflict_retries
-                backoff = min(60, 2**conflict_retries)
-                log(f"Backing off for {backoff} seconds after conflict...")
-                time.sleep(backoff)
-            else:
-                if hasattr(client, "_conflict_retries"):
-                    client._conflict_retries = 0
-                log(
-                    f"Telegram API getUpdates returned status {resp.status_code}: {resp.text}"
-                )
-
-        except Exception as e:
-            log(f"Error in main polling loop: {e}")
-
-        time.sleep(1)
+            time.sleep(1)
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

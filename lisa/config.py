@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     evolution_artifacts_dir: Path = Path("data/evolution_artifacts")
     persona_vectors_path: Path = Path("data/persona_vectors.npz")
     gating_model_path: Path = Path("data/gating_model.pkl")
+    session_token_ttl_seconds: int = 300
     local_model_path: Path | None = None
     local_model_context_size: int = 2048
     local_model_n_threads: int | None = None
@@ -70,6 +71,7 @@ class Settings(BaseSettings):
     external_timeout_seconds: int = 120
     enable_browser_tools: bool = True
     admin_api_token: str | None = None
+    allow_remote_bind: bool = False
     enable_unsafe_admin_endpoints: bool = False
     enable_legacy_bot_pairing: bool = False
     bot_security_key: str | None = None

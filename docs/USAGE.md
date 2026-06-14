@@ -4,12 +4,15 @@ This guide explains how to interact with LISA, deploy tasks, manage constitution
 
 ---
 
-## ⚡ Pairing with LISA
+## ⚡ Channel Access and Dashboard Sessions
 
-On the first start, LISA outputs a generated `LISA_ADMIN_API_TOKEN` to the CLI logs (unless defined in `.env.local`).
-1. Open your messaging client (e.g. Telegram, Slack, WhatsApp).
-2. Type and send the pairing key: `/pair <LISA_ADMIN_API_TOKEN>` or simply message the security key directly.
-3. LISA will bind to your user ID, saving it in `data/channel_access.json`. All other incoming messages from other users will be rejected.
+LISA no longer uses `data/bound_users.json`. Channel authorization is persisted through `lisa/channel_access.py` into `data/channel_access.json`.
+
+1. Configure allow-lists with `LISA_TELEGRAM_ALLOWED_USER_IDS`, `LISA_SLACK_ALLOWED_USER_IDS`, or `LISA_WHATSAPP_ALLOWED_USER_IDS`, or use the admin endpoints to authorize users.
+2. Open `/dashboard/live` in a browser.
+3. Enter the current `LISA_ADMIN_API_TOKEN` or `LISA_BOT_SECURITY_KEY` to mint a short-lived session for `/personal`, `/dashboard/snapshot`, `/tools`, `/notepad/search`, `/v1/channels`, and `/ws/*`.
+
+The dashboard HTML shell is public, but the data feeds behind it are not.
 
 ---
 
@@ -52,3 +55,13 @@ LISA will:
 2. Output the plan node-by-node.
 3. Pause for approval if a high-risk tool is hit (e.g. deleting files).
 4. Run through the DAG and report status on completion.
+
+---
+
+## 🔐 Security Posture at a Glance
+
+Safe-by-default runtime behavior:
+* Control plane bind defaults to `127.0.0.1`.
+* Non-loopback bind requires `LISA_ALLOW_REMOTE_BIND=true` plus a bootstrap credential.
+* Unsafe runtime admin routes are not mounted unless `LISA_ENABLE_UNSAFE_ADMIN_ENDPOINTS=true`.
+* Gating models load only from signed `json` + `npz` artifacts after migration.

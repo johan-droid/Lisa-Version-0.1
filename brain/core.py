@@ -120,7 +120,10 @@ class PersonaGatedModel:
 
         if gating_model is not None:
             self.gating_model = gating_model
-        elif gating_model_path is not None and gating_model_path.exists():
+        elif gating_model_path is not None and (
+            gating_model_path.exists()
+            or PersonaGatingNetwork.artifacts_exist(gating_model_path)
+        ):
             self.gating_model = PersonaGatingNetwork.load(gating_model_path)
         else:
             self.gating_model = None

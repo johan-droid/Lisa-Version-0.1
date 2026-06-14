@@ -39,13 +39,13 @@ This document details the high-level design, data flow, concurrency patterns, an
 ## 📦 Component Inventory
 
 ### 1. Supervisor Process
-The `Supervisor` acts as a process monitor. It runs in a separate lightweight process, spawning LISA's main application. It uses `psutil` to sample Resident Set Size (RSS). If RSS exceeds 800MB, it triggers soft memory shedding (garbage collection, model cache eviction). If RSS exceeds 1020MB, it performs a graceful process restart, writing the current task queue and session memory snapshots using a signed HMAC snapshot file to prevent data loss.
+The `Supervisor` acts as a process monitor. It runs in a separate lightweight process, spawning LISA's main application. The supervisor and main runtime now both take explicit lock files under `data/locks/` so a second instance exits cleanly instead of creating duplicate watchdogs or Telegram pollers.
 
 ### 2. Main Process (1GB RAM Cap)
 LISA runs inside a single Python process managed by an `asyncio` event loop. Performance tuning flags (like OMP/MKL thread counts) are restricted to prevent CPU over-subscription.
 
 ### 3. Cognitive Brain (Persona-Gated LLM)
-Cognitive blending is achieved through dynamic soft prompt vector interpolation (PersonaSoftPromptBank) combined with a gating neural network. The five core personas are:
+Cognitive blending is achieved through dynamic soft prompt vector interpolation (PersonaSoftPromptBank) combined with a gating neural network. The gating model is now stored as signed `json` + `npz` artifacts and legacy pickles are migrated one time on load. The five core personas are:
 * **Architect**: Focuses on task decomposition, DAG generation, and repository layouts.
 * **Oracle**: Specializes in detailed code construction and algorithm synthesis.
 * **Guardian**: Enforces constraints, filters malicious input, and reviews risk scores.
@@ -68,7 +68,9 @@ Tools are separated into two lists:
 Abstract user input is analyzed by the `PlanDAGEngine`. It generates a Directed Acyclic Graph of independent work steps. The Conductor schedules frontier tasks across up to 10 concurrent execution arms using a Semaphore constraint.
 
 ### 7. Safety & Boundaries
-* **Capability Tokens**: Every tool request must present a token signed with the session key matching the required scope (e.g. `file:write`, `terminal:exec`).
+* **Dashboard Session Tokens**: `/personal`, dashboard data endpoints, and `/ws/*` require a short-lived server-issued session token rather than trusting a bare query parameter or open websocket upgrade.
+* **Localhost by Default**: `HOST` defaults to `127.0.0.1`; remote bind is an explicit opt-in through `LISA_ALLOW_REMOTE_BIND=true`.
+* **Channel Access Control**: Per-channel authorization is persisted atomically in `data/channel_access.json` through `ChannelAccessController`.
 * **Taint Tracking**: Inbound webhook messages from external sources are labeled as `tainted`. Taint flags propagate through string parsing operations. Any terminal execution using tainted parameters is automatically paused for Human-In-The-Loop (HITL) verification.
 
 ---
@@ -77,7 +79,7 @@ Abstract user input is analyzed by the `PlanDAGEngine`. It generates a Directed 
 
 ### A. Inbound Message to Response
 ```
-[User Webhook] -> [MessageHub Signature Check] -> [Security Key Validation]
+[User Webhook] -> [MessageHub Signature Check] -> [ChannelAccessController]
       |
       v
 [TaskConductor Queue] -> [Brain Gating Network Blending] -> [LLM Client Call]
@@ -97,7 +99,7 @@ Abstract user input is analyzed by the `PlanDAGEngine`. It generates a Directed 
 ---
 
 ## 💾 Memory Management Strategy
-LISA manages its 1GB RAM budget using a tiered eviction system:
+LISA manages its current RAM budget using a tiered eviction system:
 1. **Soft Eviction (RSS > 750MB)**: EVM model layer unloads soft prompt weights and clears HTTP connection pools.
 2. **Hard Eviction (RSS > 850MB)**: Invokes `gc.collect()` and evicts browser cache files to database storage.
 3. **Emergency Offloading (RSS > 950MB)**: Suspends all parallel tasks, saves a state snapshot, and forces a worker restart.

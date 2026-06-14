@@ -171,11 +171,11 @@ def train_gating_bundle(
         early_stopping=True,
     )
     classifier.fit(features, labels)
-    bundle = PersonaSklearnGatingBundle(
-        vectorizer=vectorizer,
-        classifier=classifier,
-        personas=tuple(persona.value for persona in Persona),
-        trained_at=datetime.now(timezone.utc).isoformat(),
+    bundle = PersonaSklearnGatingBundle.from_legacy_objects(
+        vectorizer,
+        classifier,
+        tuple(persona.value for persona in Persona),
+        datetime.now(timezone.utc).isoformat(),
     )
     bundle.save(output_path)
     return bundle

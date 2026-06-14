@@ -3,9 +3,13 @@ import time
 import sys
 import os
 import signal
+from pathlib import Path
+
 import psutil
 import logging
 import httpx
+
+from utils.process_lock import ProcessLock, ProcessLockHeldError
 
 # Configure Logging
 logging.basicConfig(
@@ -91,98 +95,88 @@ def start_lisa() -> subprocess.Popen:
 
 
 def monitor_lisa() -> None:
-    os.makedirs("data", exist_ok=True)
-    pid_file = "data/lisa.pid"
-
-    # Try to write PID atomically
-    import fcntl
-
-    try:
-        pid_fd = open(pid_file, "w")
-        fcntl.flock(pid_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        pid_fd.write(str(os.getpid()))
-        pid_fd.flush()
-    except (IOError, BlockingIOError):
-        try:
-            with open(pid_file, "r") as f:
-                holding_pid = f.read().strip()
-        except IOError:
-            holding_pid = "unknown"
-        logger.error(
-            f"Cannot start supervisor: LISA is already running (PID: {holding_pid}). Exiting."
-        )
-        sys.exit(1)
-
     os.makedirs("logs", exist_ok=True)
+    lock = ProcessLock(Path("data") / "locks" / "supervisor.lock", role="supervisor")
+    try:
+        lock.acquire()
+    except ProcessLockHeldError as exc:
+        holder = exc.holder
+        if holder is not None and holder.pid is not None:
+            logger.error(
+                "Supervisor lock is already held by PID %s. Refusing to start another supervisor.",
+                holder.pid,
+            )
+        else:
+            logger.error("Supervisor lock is already held. Refusing to start.")
+        sys.exit(1)
 
     restart_attempts = 0
 
-    while restart_attempts < MAX_RESTART_ATTEMPTS:
-        process = start_lisa()
-        logger.info(f"LISA started with PID {process.pid}")
-        restart_attempts += 1
+    try:
+        while restart_attempts < MAX_RESTART_ATTEMPTS:
+            process = start_lisa()
+            logger.info(f"LISA started with PID {process.pid}")
+            restart_attempts += 1
 
-        # Wait for LISA to boot
-        time.sleep(5)
-        start_time = time.time()
+            # Wait for LISA to boot
+            time.sleep(5)
+            start_time = time.time()
 
-        while True:
-            # Check if process died
-            if process.poll() is not None:
-                exit_code = process.returncode
-                logger.warning(f"LISA exited unexpectedly with code {exit_code}")
-                if time.time() - start_time > 60:
-                    restart_attempts = 0
-                    logger.info(
-                        "Process ran stably for >60s, resetting restart counter."
-                    )
-                break
-
-            # Check memory usage
-            rss = get_process_memory_usage(process.pid)
-            rss_mb = rss / (1024 * 1024)
-
-            if rss_mb > RSS_LIMIT_MB:
-                logger.warning(
-                    f"LISA exceeded critical memory limit: {rss_mb:.2f}MB > {RSS_LIMIT_MB}MB. Triggering restart."
-                )
-                graceful_shutdown(process)
-                break
-            elif rss_mb > 800:
-                logger.warning(
-                    f"LISA memory pressure detected: {rss_mb:.2f}MB > 800MB. Triggering memory shedding."
-                )
-                try:
-                    with httpx.Client(timeout=5.0) as client:
-                        resp = client.post(f"{LISA_URL}/shed_memory")
+            while True:
+                if process.poll() is not None:
+                    exit_code = process.returncode
+                    logger.warning(f"LISA exited unexpectedly with code {exit_code}")
+                    if time.time() - start_time > 60:
+                        restart_attempts = 0
                         logger.info(
-                            f"Memory shedding status: {resp.status_code} - {resp.text}"
+                            "Process ran stably for >60s, resetting restart counter."
                         )
+                    break
+
+                rss = get_process_memory_usage(process.pid)
+                rss_mb = rss / (1024 * 1024)
+
+                if rss_mb > RSS_LIMIT_MB:
+                    logger.warning(
+                        f"LISA exceeded critical memory limit: {rss_mb:.2f}MB > {RSS_LIMIT_MB}MB. Triggering restart."
+                    )
+                    graceful_shutdown(process)
+                    break
+                elif rss_mb > 800:
+                    logger.warning(
+                        f"LISA memory pressure detected: {rss_mb:.2f}MB > 800MB. Triggering memory shedding."
+                    )
+                    try:
+                        with httpx.Client(timeout=5.0) as client:
+                            resp = client.post(f"{LISA_URL}/shed_memory")
+                            logger.info(
+                                f"Memory shedding status: {resp.status_code} - {resp.text}"
+                            )
+                    except Exception as e:
+                        logger.warning(f"Could not trigger memory shedding: {e}")
+
+                try:
+                    with httpx.Client(timeout=2.0) as client:
+                        resp = client.get(f"{LISA_URL}/health")
+                        if resp.status_code != 200:
+                            logger.warning(
+                                f"LISA health check returned status {resp.status_code}"
+                            )
                 except Exception as e:
-                    logger.warning(f"Could not trigger memory shedding: {e}")
+                    logger.warning(f"LISA health check failed: {e}")
 
-            # Heartbeat check
-            try:
-                with httpx.Client(timeout=2.0) as client:
-                    resp = client.get(f"{LISA_URL}/health")
-                    if resp.status_code != 200:
-                        logger.warning(
-                            f"LISA health check returned status {resp.status_code}"
-                        )
-            except Exception as e:
-                logger.warning(f"LISA health check failed: {e}")
+                time.sleep(CHECK_INTERVAL_SECONDS)
 
-            time.sleep(CHECK_INTERVAL_SECONDS)
+            backoff = BACKOFF_FACTOR**restart_attempts
+            logger.info(
+                f"Backing off for {backoff} seconds before restart #{restart_attempts + 1}..."
+            )
+            time.sleep(backoff)
 
-        # Backoff logic
-        backoff = BACKOFF_FACTOR**restart_attempts
-        logger.info(
-            f"Backing off for {backoff} seconds before restart #{restart_attempts + 1}..."
-        )
-        time.sleep(backoff)
-
-    logger.error("Maximum restart attempts reached. Supervisor exiting.")
-    sys.exit(1)
+        logger.error("Maximum restart attempts reached. Supervisor exiting.")
+        sys.exit(1)
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

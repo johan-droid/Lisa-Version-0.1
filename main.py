@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import signal
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,8 +18,9 @@ from lisa.api import create_app
 from lisa.config import Settings
 from utils.encryption import load_api_keys
 from utils.env_check import check_environment
-from utils.observability import configure_sentry
 from utils.logger import configure_logging
+from utils.observability import configure_sentry
+from utils.process_lock import ProcessLock, ProcessLockHeldError
 
 LOGGER = logging.getLogger("lisa.startup")
 
@@ -153,6 +155,8 @@ def _collect_settings_payload(raw: dict[str, Any]) -> dict[str, Any]:
         "external_timeout_seconds",
         "enable_browser_tools",
         "admin_api_token",
+        "session_token_ttl_seconds",
+        "allow_remote_bind",
         "enable_unsafe_admin_endpoints",
         "enable_legacy_bot_pairing",
         "telegram_allowed_user_ids",
@@ -274,13 +278,6 @@ def _default_bind_host() -> str:
     env_host = os.environ.get("HOST") or os.environ.get("LISA_HOST")
     if env_host:
         return env_host
-
-    if any(
-        os.environ.get(name)
-        for name in ("PORT", "RENDER", "DYNO", "RAILWAY_ENVIRONMENT")
-    ):
-        return "0.0.0.0"
-
     return "127.0.0.1"
 
 
@@ -316,6 +313,53 @@ def _print_banner(settings: Settings, bootstrap: BootstrapConfig) -> None:
     print("\n".join(banner_lines))
 
 
+def _is_loopback_host(host: str) -> bool:
+    normalized = str(host or "").strip().lower()
+    return normalized in {"127.0.0.1", "localhost", "::1"}
+
+
+def _session_bootstrap_available(settings: Settings) -> bool:
+    return bool(
+        str(getattr(settings, "admin_api_token", "") or "").strip()
+        or str(getattr(settings, "bot_security_key", "") or "").strip()
+    )
+
+
+def _warn_remote_binding(host: str, role: str) -> None:
+    for _ in range(3):
+        LOGGER.warning(
+            "%s is binding to non-loopback host %s. Session auth bootstrap must remain enabled.",
+            role,
+            host,
+        )
+
+
+def _validate_network_exposure(settings: Settings, host: str) -> None:
+    if not _is_loopback_host(host):
+        if not settings.allow_remote_bind:
+            raise RuntimeError(
+                f"Refusing to bind the control plane to {host} without LISA_ALLOW_REMOTE_BIND=true."
+            )
+        if not _session_bootstrap_available(settings):
+            raise RuntimeError(
+                "Refusing remote control-plane bind because no admin token or bot security key is configured."
+            )
+        _warn_remote_binding(host, "Control plane")
+
+    if settings.message_hub_enabled and settings.message_hub_start_listener:
+        hub_host = str(settings.message_hub_host or "").strip() or "127.0.0.1"
+        if not _is_loopback_host(hub_host):
+            if not settings.allow_remote_bind:
+                raise RuntimeError(
+                    f"Refusing to bind the message hub listener to {hub_host} without LISA_ALLOW_REMOTE_BIND=true."
+                )
+            if not _session_bootstrap_available(settings):
+                raise RuntimeError(
+                    "Refusing remote message hub bind because no admin token or bot security key is configured."
+                )
+            _warn_remote_binding(hub_host, "Message hub")
+
+
 def main() -> None:
     os.makedirs("data", exist_ok=True)
     pid_file = "data/lisa.pid"
@@ -346,6 +390,23 @@ def main() -> None:
     apply_memory_limit()
     config_path = Path(args.config).resolve()
     settings, bootstrap = load_bootstrap_config(config_path)
+    _validate_network_exposure(settings, args.host)
+    process_lock = ProcessLock(
+        settings.workspace_root / "data" / "locks" / "main.lock",
+        role="main",
+    )
+    try:
+        process_lock.acquire()
+    except ProcessLockHeldError as exc:
+        holder = exc.holder
+        if holder is not None and holder.pid is not None:
+            LOGGER.error(
+                "Main process lock is already held by PID %s. Refusing to start a second instance.",
+                holder.pid,
+            )
+        else:
+            LOGGER.error("Main process lock is already held. Refusing to start.")
+        sys.exit(1)
     key_vault_path = settings.workspace_root / "keys.enc"
     master_key = os.environ.get("LISA_MASTER_KEY") or os.environ.get(
         "LISA_KEYS_MASTER_KEY"
@@ -367,7 +428,7 @@ def main() -> None:
     logger.info("Bootstrap config loaded from %s", config_path)
     if settings.bot_security_key:
         logger.warning(
-            "LISA_BOT_SECURITY_KEY is deprecated and ignored by the current channel access model."
+            "LISA_BOT_SECURITY_KEY is deprecated for channel pairing but is still accepted for short-lived dashboard session bootstrap."
         )
     configure_sentry(settings, logger=logger)
     env_result = check_environment(settings, bootstrap)
@@ -377,10 +438,13 @@ def main() -> None:
         for error in env_result.errors:
             logger.error(error)
         env_result.raise_if_failed()
-    app = build_app(settings, bootstrap)
-    _print_banner(settings, bootstrap)
-    logger.info("Starting FastAPI control plane on %s:%s", args.host, args.port)
-    asyncio.run(_serve(app, args.host, args.port, args.reload, args.log_level))
+    try:
+        app = build_app(settings, bootstrap)
+        _print_banner(settings, bootstrap)
+        logger.info("Starting FastAPI control plane on %s:%s", args.host, args.port)
+        asyncio.run(_serve(app, args.host, args.port, args.reload, args.log_level))
+    finally:
+        process_lock.release()
 
 
 async def _serve(app, host: str, port: int, reload: bool, log_level: str) -> None:

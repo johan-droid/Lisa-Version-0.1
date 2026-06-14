@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
-import hmac
-import hashlib
 import os
+import pickle
 import re
+from types import SimpleNamespace
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from hashlib import sha256
+import hmac
 from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
 
 from lisa.personas import Persona
+from utils.snapshot import get_hmac_key
 
 TOKEN_PATTERN = re.compile(r"[a-z0-9_]+")
 
@@ -28,42 +32,107 @@ def softmax(logits: np.ndarray) -> np.ndarray:
     return exps / np.sum(exps)
 
 
+def _artifact_paths(path: Path) -> tuple[Path, Path, Path]:
+    base = Path(path)
+    metadata_path = base.with_suffix(".json")
+    weights_path = base.with_suffix(".npz")
+    signature_path = base.with_suffix(".sig")
+    return metadata_path, weights_path, signature_path
+
+
+def _signing_context(path: Path) -> Any:
+    return SimpleNamespace(
+        workspace_root=path.parent.parent,
+        bot_security_key=os.environ.get("LISA_BOT_SECURITY_KEY"),
+    )
+
+
+def _metadata_bytes(metadata: dict[str, Any]) -> bytes:
+    return json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _weights_bytes(arrays: dict[str, np.ndarray]) -> bytes:
+    buffer = io.BytesIO()
+    np.savez_compressed(buffer, **arrays)
+    return buffer.getvalue()
+
+
+def _artifact_signature(path: Path, metadata: dict[str, Any], weights_blob: bytes) -> str:
+    key = get_hmac_key(_signing_context(path))
+    payload = _metadata_bytes(metadata) + b"\n" + weights_blob
+    return hmac.new(key, payload, sha256).hexdigest()
+
+
+def _write_artifacts(path: Path, metadata: dict[str, Any], arrays: dict[str, np.ndarray]) -> None:
+    metadata_path, weights_path, signature_path = _artifact_paths(path)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    safe_arrays = {
+        name: np.asarray(array)
+        for name, array in arrays.items()
+    }
+    weights_blob = _weights_bytes(safe_arrays)
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    weights_path.write_bytes(weights_blob)
+    signature_path.write_text(
+        _artifact_signature(path, metadata, weights_blob),
+        encoding="utf-8",
+    )
+
+
+def _load_artifacts(path: Path) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    metadata_path, weights_path, signature_path = _artifact_paths(path)
+    if not (metadata_path.exists() and weights_path.exists() and signature_path.exists()):
+        raise FileNotFoundError(f"Signed gating artifacts are missing for {path}.")
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    weights_blob = weights_path.read_bytes()
+    signature = signature_path.read_text(encoding="utf-8").strip()
+    expected_signature = _artifact_signature(path, metadata, weights_blob)
+    if not signature or not hmac.compare_digest(signature, expected_signature):
+        raise ValueError(f"Gating model signature check failed for {path}.")
+
+    with np.load(io.BytesIO(weights_blob), allow_pickle=False) as payload:
+        arrays = {name: payload[name] for name in payload.files}
+    return metadata, arrays
+
+
 @dataclass(slots=True)
 class PersonaSklearnGatingBundle:
-    """Compact TF-IDF + MLP gating model stored in one pickle file.
+    """Compact TF-IDF + single-hidden-layer MLP gating model stored safely."""
 
-    The runtime can load this bundle directly or convert it back into the
-    lightweight in-repo gating network interface.
-    """
-
-    vectorizer: Any
-    classifier: Any
+    vocabulary: dict[str, int]
+    idf: np.ndarray
+    classes: tuple[str, ...]
+    hidden_weights: np.ndarray
+    hidden_bias: np.ndarray
+    output_weights: np.ndarray
+    output_bias: np.ndarray
     personas: tuple[str, ...]
     trained_at: str | None = None
 
     def save(self, path: Path) -> None:
-        import pickle
-
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("wb") as handle:
-            pickle.dump(self.to_state(), handle, protocol=pickle.HIGHEST_PROTOCOL)
+        _write_artifacts(path, self.to_metadata(), self.to_arrays())
 
     @classmethod
     def load(cls, path: Path) -> "PersonaSklearnGatingBundle":
-        import pickle
-
-        path = Path(path)
-        with path.open("rb") as handle:
-            state = pickle.load(handle)
-        if isinstance(state, cls):
-            return state
-        return cls.from_state(state)
+        metadata, arrays = _load_artifacts(Path(path))
+        if metadata.get("format") != "sklearn_bundle_v2":
+            raise ValueError(f"Unsupported sklearn gating metadata at {path}.")
+        return cls.from_serialized(metadata, arrays)
 
     def to_state(self) -> dict[str, Any]:
         return {
-            "vectorizer": self.vectorizer,
-            "classifier": self.classifier,
+            "vocabulary": self.vocabulary,
+            "idf": self.idf,
+            "classes": self.classes,
+            "hidden_weights": self.hidden_weights,
+            "hidden_bias": self.hidden_bias,
+            "output_weights": self.output_weights,
+            "output_bias": self.output_bias,
             "personas": self.personas,
             "trained_at": self.trained_at,
         }
@@ -71,23 +140,43 @@ class PersonaSklearnGatingBundle:
     @classmethod
     def from_state(cls, state: dict[str, Any]) -> "PersonaSklearnGatingBundle":
         return cls(
-            vectorizer=state["vectorizer"],
-            classifier=state["classifier"],
+            vocabulary=dict(state["vocabulary"]),
+            idf=np.asarray(state["idf"], dtype=np.float32),
+            classes=tuple(state["classes"]),
+            hidden_weights=np.asarray(state["hidden_weights"], dtype=np.float32),
+            hidden_bias=np.asarray(state["hidden_bias"], dtype=np.float32),
+            output_weights=np.asarray(state["output_weights"], dtype=np.float32),
+            output_bias=np.asarray(state["output_bias"], dtype=np.float32),
             personas=tuple(
                 state.get("personas") or tuple(persona.value for persona in Persona)
             ),
             trained_at=state.get("trained_at"),
         )
 
+    @classmethod
+    def from_serialized(
+        cls, metadata: dict[str, Any], arrays: dict[str, np.ndarray]
+    ) -> "PersonaSklearnGatingBundle":
+        return cls(
+            vocabulary={str(key): int(value) for key, value in metadata["vocabulary"].items()},
+            idf=np.asarray(arrays["idf"], dtype=np.float32),
+            classes=tuple(str(item) for item in metadata["classes"]),
+            hidden_weights=np.asarray(arrays["hidden_weights"], dtype=np.float32),
+            hidden_bias=np.asarray(arrays["hidden_bias"], dtype=np.float32),
+            output_weights=np.asarray(arrays["output_weights"], dtype=np.float32),
+            output_bias=np.asarray(arrays["output_bias"], dtype=np.float32),
+            personas=tuple(str(item) for item in metadata["personas"]),
+            trained_at=metadata.get("trained_at"),
+        )
+
     def predict_proba(self, text: str) -> dict[str, float]:
-        features = self.vectorizer.transform([text])
-        if hasattr(features, "toarray"):
-            features = features.toarray()
-        probabilities = self.classifier.predict_proba(features)[0]
-        class_names = getattr(self.classifier, "classes_", self.personas)
+        features = self._transform(text)
+        hidden = np.tanh(features @ self.hidden_weights + self.hidden_bias)
+        logits = hidden @ self.output_weights + self.output_bias
+        probabilities = softmax(logits)
         return {
             str(persona): float(probability)
-            for persona, probability in zip(class_names, probabilities, strict=True)
+            for persona, probability in zip(self.classes, probabilities, strict=True)
         }
 
     def predict_blend(self, text: str) -> dict[str, float]:
@@ -105,20 +194,82 @@ class PersonaSklearnGatingBundle:
         return self.predict_blend(text)
 
     def metadata(self) -> dict[str, Any]:
-        hidden_sizes = getattr(self.classifier, "hidden_layer_sizes", None)
-        if isinstance(hidden_sizes, tuple):
-            hidden_size = list(hidden_sizes)
-        elif hidden_sizes is None:
-            hidden_size = []
-        else:
-            hidden_size = [int(hidden_sizes)]
         return {
             "format": "sklearn",
             "personas": list(self.personas),
-            "feature_count": len(getattr(self.vectorizer, "vocabulary_", {})),
-            "hidden_size": hidden_size,
+            "feature_count": len(self.vocabulary),
+            "hidden_size": [int(self.hidden_weights.shape[1])],
             "trained_at": self.trained_at,
         }
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "format": "sklearn_bundle_v2",
+            "personas": list(self.personas),
+            "classes": list(self.classes),
+            "vocabulary": {key: int(value) for key, value in self.vocabulary.items()},
+            "trained_at": self.trained_at,
+        }
+
+    def to_arrays(self) -> dict[str, np.ndarray]:
+        return {
+            "idf": np.asarray(self.idf, dtype=np.float32),
+            "hidden_weights": np.asarray(self.hidden_weights, dtype=np.float32),
+            "hidden_bias": np.asarray(self.hidden_bias, dtype=np.float32),
+            "output_weights": np.asarray(self.output_weights, dtype=np.float32),
+            "output_bias": np.asarray(self.output_bias, dtype=np.float32),
+        }
+
+    def _transform(self, text: str) -> np.ndarray:
+        vector = np.zeros(len(self.vocabulary), dtype=np.float32)
+        tokens = tokenize(text)
+        if not tokens:
+            return vector
+        counts: dict[int, int] = {}
+        for token in tokens:
+            index = self.vocabulary.get(token)
+            if index is None:
+                continue
+            counts[index] = counts.get(index, 0) + 1
+        if not counts:
+            return vector
+        total = float(sum(counts.values()))
+        for index, count in counts.items():
+            vector[index] = (count / total) * self.idf[index]
+        norm = float(np.linalg.norm(vector))
+        if norm > 0.0:
+            vector /= norm
+        return vector
+
+    @classmethod
+    def from_legacy_objects(
+        cls,
+        vectorizer: Any,
+        classifier: Any,
+        personas: tuple[str, ...],
+        trained_at: str | None,
+    ) -> "PersonaSklearnGatingBundle":
+        if len(getattr(classifier, "coefs_", [])) != 2 or len(
+            getattr(classifier, "intercepts_", [])
+        ) != 2:
+            raise ValueError("Only single-hidden-layer MLP gating bundles can be migrated safely.")
+        activation = str(getattr(classifier, "activation", "tanh")).lower()
+        if activation != "tanh":
+            raise ValueError(f"Unsupported gating activation {activation!r}.")
+        vocabulary = dict(getattr(vectorizer, "vocabulary_", {}) or {})
+        idf = np.asarray(getattr(vectorizer, "idf_", []), dtype=np.float32)
+        classes = tuple(str(item) for item in getattr(classifier, "classes_", personas))
+        return cls(
+            vocabulary=vocabulary,
+            idf=idf,
+            classes=classes,
+            hidden_weights=np.asarray(classifier.coefs_[0], dtype=np.float32),
+            hidden_bias=np.asarray(classifier.intercepts_[0], dtype=np.float32),
+            output_weights=np.asarray(classifier.coefs_[1], dtype=np.float32),
+            output_bias=np.asarray(classifier.intercepts_[1], dtype=np.float32),
+            personas=personas,
+            trained_at=trained_at,
+        )
 
 
 @dataclass(slots=True)
@@ -275,165 +426,35 @@ class PersonaGatingNetwork:
             learning_rate=learning_rate,
         )
 
-    def save(self, path: Path) -> None:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        state = self.to_state()
-
-        # Serialize arrays to npz
-        npz_path = path.with_suffix(".npz")
-        arrays = {
-            "W1": state["W1"],
-            "b1": state["b1"],
-            "W2": state["W2"],
-            "b2": state["b2"],
-        }
-        np.savez(npz_path, **arrays)
-
-        # Serialize metadata to json
-        # Make sure numpy arrays in encoder state are converted to lists
-        encoder_state = state["encoder"]
-
-        def _convert_ndarrays(d):
-            import numpy as np
-
-            for k, v in d.items():
-                if isinstance(v, np.ndarray):
-                    d[k] = v.tolist()
-                elif isinstance(v, dict):
-                    _convert_ndarrays(v)
-            return d
-
-        encoder_state = _convert_ndarrays(encoder_state)
-
-        metadata = {
-            "encoder": encoder_state,
-            "hidden_size": state["hidden_size"],
-            "personas": state["personas"],
-            "trained_at": state["trained_at"],
-        }
-        import json
-
-        json_data = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
-
-        # Generate HMAC signature using existing snapshot signing key mechanism or a fallback
-        master_key = os.environ.get("LISA_MASTER_KEY") or os.environ.get(
-            "LISA_KEYS_MASTER_KEY", "default-insecure-key-do-not-use-in-prod"
-        )
-        sig = hmac.new(
-            master_key.encode("utf-8"), json_data, hashlib.sha256
-        ).hexdigest()
-
-        signed_metadata = {"metadata": metadata, "signature": sig}
-        json_path = path.with_suffix(".json")
-        json_path.write_text(
-            json.dumps(signed_metadata, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-
     @classmethod
     def load(cls, path: Path) -> "PersonaGatingNetwork":
         path = Path(path)
-        import json
-        import os
-        import hmac
-        import hashlib
+        if cls.artifacts_exist(path):
+            metadata, arrays = _load_artifacts(path)
+            artifact_format = metadata.get("format")
+            if artifact_format == "persona_network_v2":
+                return cls.from_serialized(metadata, arrays)
+            if artifact_format == "sklearn_bundle_v2":
+                return PersonaSklearnGatingBundle.from_serialized(metadata, arrays)
+            raise ValueError(f"Unsupported gating artifact format {artifact_format!r}.")
 
-        # Migration from legacy pickle
-        if path.exists() and path.suffix == ".pkl":
-            import pickle
-
-            with path.open("rb") as handle:
-                state = pickle.load(handle)
-            # Create network from pickle state
-            if isinstance(state, PersonaSklearnGatingBundle):
-                # Cannot migrate bundle directly easily, reinitialize
-                network = cls.initialize()
-            elif (
-                isinstance(state, dict)
-                and "vectorizer" in state
-                and "classifier" in state
-            ):
-                network = cls.initialize()
-            elif isinstance(state, dict) and "W1" in state:
-                network = cls.from_state(state)
-            else:
-                # If it's a bundle, not supported anymore in raw format, return init
-                network = cls.initialize()
-
-            # Migrate to new format
-            new_path = path.with_suffix(".npz")
-            network.save(new_path)
-            # Delete old pickle
-            try:
-                path.unlink()
-            except OSError:
-                pass
-            return network
-
-        npz_path = path.with_suffix(".npz")
-        json_path = path.with_suffix(".json")
-
-        if not npz_path.exists() or not json_path.exists():
-            raise FileNotFoundError(
-                f"Gating model files not found: {npz_path}, {json_path}"
-            )
-
-        json_content = json_path.read_text(encoding="utf-8")
-        payload = json.loads(json_content)
-
-        metadata = payload.get("metadata", {})
-        signature = payload.get("signature", "")
-
-        master_key = os.environ.get("LISA_MASTER_KEY") or os.environ.get(
-            "LISA_KEYS_MASTER_KEY", "default-insecure-key-do-not-use-in-prod"
-        )
-        expected_sig = hmac.new(
-            master_key.encode("utf-8"),
-            json.dumps(metadata, ensure_ascii=False).encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-
-        if not hmac.compare_digest(signature, expected_sig):
-            raise PermissionError(
-                "Gating model signature verification failed. The file may have been tampered with."
-            )
-
-        arrays = np.load(npz_path, allow_pickle=False)
-
-        state = {
-            "encoder": metadata["encoder"],
-            "hidden_size": metadata["hidden_size"],
-            "personas": metadata["personas"],
-            "trained_at": metadata["trained_at"],
-            "W1": arrays["W1"],
-            "b1": arrays["b1"],
-            "W2": arrays["W2"],
-            "b2": arrays["b2"],
-        }
-        # reconstruct the ndarray for encoder idf_ if it's a list
-        if "idf_" in state["encoder"] and isinstance(state["encoder"]["idf_"], list):
-            state["encoder"]["idf_"] = np.array(
-                state["encoder"]["idf_"], dtype=np.float32
-            )
-
-        return cls.from_state(state)
+        if path.exists():
+            migrated = cls._migrate_legacy_pickle(path)
+            path.unlink(missing_ok=True)
+            return migrated
+        raise FileNotFoundError(path)
 
     @classmethod
     def load_or_initialize(cls, path: Path) -> "PersonaGatingNetwork":
-        path = Path(path)
-        npz_path = path.with_suffix(".npz")
-        if npz_path.exists() or path.exists():
-            try:
-                return cls.load(path)
-            except Exception as e:
-                import logging
-
-                logging.getLogger("lisa.gating").warning(
-                    f"Failed to load gating model: {e}. Reinitializing."
-                )
+        if cls.artifacts_exist(path) or path.exists():
+            return cls.load(path)
         network = cls.initialize()
-        network.save(path.with_suffix(".npz"))
+        network.save(path)
         return network
+
+    def save(self, path: Path) -> None:
+        path = Path(path)
+        _write_artifacts(path, self.to_metadata(), self.to_arrays())
 
     def to_state(self) -> dict[str, Any]:
         return {
@@ -447,6 +468,25 @@ class PersonaGatingNetwork:
             "trained_at": self.trained_at,
         }
 
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "format": "persona_network_v2",
+            "encoder_max_features": int(self.encoder.max_features),
+            "vocabulary": {key: int(value) for key, value in self.encoder.vocabulary.items()},
+            "hidden_size": int(self.hidden_size),
+            "personas": list(self.personas),
+            "trained_at": self.trained_at,
+        }
+
+    def to_arrays(self) -> dict[str, np.ndarray]:
+        return {
+            "idf": np.asarray(self.encoder.idf, dtype=np.float32),
+            "W1": np.asarray(self.W1, dtype=np.float32),
+            "b1": np.asarray(self.b1, dtype=np.float32),
+            "W2": np.asarray(self.W2, dtype=np.float32),
+            "b2": np.asarray(self.b2, dtype=np.float32),
+        }
+
     @classmethod
     def from_state(cls, state: dict[str, Any]) -> "PersonaGatingNetwork":
         return cls(
@@ -458,6 +498,29 @@ class PersonaGatingNetwork:
             W2=np.asarray(state["W2"], dtype=np.float32),
             b2=np.asarray(state["b2"], dtype=np.float32),
             trained_at=state.get("trained_at"),
+        )
+
+    @classmethod
+    def from_serialized(
+        cls, metadata: dict[str, Any], arrays: dict[str, np.ndarray]
+    ) -> "PersonaGatingNetwork":
+        encoder = TfIdfEncoder(
+            max_features=int(metadata["encoder_max_features"]),
+            vocabulary={
+                str(key): int(value)
+                for key, value in dict(metadata["vocabulary"]).items()
+            },
+            idf=np.asarray(arrays["idf"], dtype=np.float32),
+        )
+        return cls(
+            encoder=encoder,
+            hidden_size=int(metadata["hidden_size"]),
+            personas=tuple(str(item) for item in metadata["personas"]),
+            W1=np.asarray(arrays["W1"], dtype=np.float32),
+            b1=np.asarray(arrays["b1"], dtype=np.float32),
+            W2=np.asarray(arrays["W2"], dtype=np.float32),
+            b2=np.asarray(arrays["b2"], dtype=np.float32),
+            trained_at=metadata.get("trained_at"),
         )
 
     def fit(
@@ -550,6 +613,34 @@ class PersonaGatingNetwork:
         target = np.zeros(len(self.personas), dtype=np.float32)
         target[self.personas.index(example.target)] = 1.0
         return target
+
+    @classmethod
+    def artifacts_exist(cls, path: Path) -> bool:
+        metadata_path, weights_path, signature_path = _artifact_paths(Path(path))
+        return metadata_path.exists() and weights_path.exists() and signature_path.exists()
+
+    @classmethod
+    def _migrate_legacy_pickle(cls, path: Path) -> "PersonaGatingNetwork":
+        with Path(path).open("rb") as handle:
+            state = pickle.load(handle)
+        if isinstance(state, PersonaSklearnGatingBundle):
+            bundle = state
+            bundle.save(path)
+            return bundle
+        if isinstance(state, dict) and "vectorizer" in state and "classifier" in state:
+            bundle = PersonaSklearnGatingBundle.from_legacy_objects(
+                state["vectorizer"],
+                state["classifier"],
+                tuple(state.get("personas") or tuple(persona.value for persona in Persona)),
+                state.get("trained_at"),
+            )
+            bundle.save(path)
+            return bundle
+        if isinstance(state, dict):
+            network = cls.from_state(state)
+            network.save(path)
+            return network
+        raise ValueError(f"Unsupported legacy gating pickle at {path}.")
 
 
 @dataclass(slots=True)

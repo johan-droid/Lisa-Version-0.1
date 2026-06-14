@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -69,7 +71,7 @@ class ChannelAccessController:
         if not self.storage_path.exists():
             return
         try:
-            payload = json.loads(self.storage_path.read_text(encoding="utf-8"))
+            payload = self._read_payload()
         except (OSError, json.JSONDecodeError):
             return
         if not isinstance(payload, dict):
@@ -86,30 +88,42 @@ class ChannelAccessController:
             for source, user_ids in self._rules.items()
             if user_ids
         }
+        lock_path = self.storage_path.with_suffix(f"{self.storage_path.suffix}.lock")
+        fd: int | None = None
+        for _ in range(50):
+            try:
+                fd = os.open(
+                    str(lock_path),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                )
+                break
+            except FileExistsError:
+                time.sleep(0.02)
+        if fd is None:
+            raise OSError(f"Could not acquire channel access lock {lock_path}")
 
-        # Atomic rename-under-lock
-        import tempfile
-        import os
-
-        # Create temp file in same directory to ensure rename is atomic
-        fd, temp_path = tempfile.mkstemp(
-            dir=str(self.storage_path.parent), suffix=".tmp", prefix="channel_access_"
-        )
-        temp_file = Path(temp_path)
+        temp_path = self.storage_path.with_suffix(f"{self.storage_path.suffix}.tmp")
         try:
-            with open(fd, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
+            with os.fdopen(fd, "w", encoding="utf-8") as lock_handle:
+                lock_handle.write(str(os.getpid()))
+            temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(temp_path, self.storage_path)
             try:
-                temp_file.chmod(0o600)
+                self.storage_path.chmod(0o600)
             except OSError:
                 pass
-            os.replace(temp_path, str(self.storage_path))
-        except Exception:
+        finally:
             try:
-                os.unlink(temp_path)
+                temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-            raise
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _read_payload(self) -> dict[str, Any]:
+        return json.loads(self.storage_path.read_text(encoding="utf-8"))
 
     @staticmethod
     def _normalize_ids(value: Any) -> list[str]:

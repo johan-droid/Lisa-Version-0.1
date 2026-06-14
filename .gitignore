@@ -48,6 +48,7 @@ coverage.xml
 # Local configuration & secrets
 .env
 .env.local
+.envrc
 .env.*.local
 .env.development
 .env.test
@@ -55,6 +56,15 @@ coverage.xml
 .env.development.local
 .env.test.local
 .env.production.local
+*.secret
+*.secrets
+*.pem
+*.p12
+*.pfx
+*.key
+keys.enc
+secrets/
+data/.snapshot.key
 
 # Databases & local state
 data/
@@ -77,3 +87,10 @@ models/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Logs and runtime artifacts
+*.log
+logs/
+lisa.log
+workspace/
+*.snap

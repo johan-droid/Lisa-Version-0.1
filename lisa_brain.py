@@ -146,7 +146,9 @@ def _load_or_train_gating_model(
 ) -> PersonaGatingNetwork:
     if force_train or not csv_path.exists():
         write_synthetic_persona_training_csv(csv_path, count=500)
-    if force_train or not model_path.exists():
+    if force_train or not (
+        model_path.exists() or PersonaGatingNetwork.artifacts_exist(model_path)
+    ):
         gating = train_persona_gating_network(
             csv_path,
             max_features=500,

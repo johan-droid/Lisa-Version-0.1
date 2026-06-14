@@ -26,7 +26,10 @@ def build_audit_client(tmp_path: Path, queue_size: int = 128) -> TestClient:
         admin_api_token=ADMIN_TOKEN,
         enable_unsafe_admin_endpoints=False,
     )
-    return TestClient(create_app(settings))
+    client = TestClient(create_app(settings))
+    auth = client.post("/auth/session", json={"credential": ADMIN_TOKEN})
+    assert auth.status_code == 200
+    return client
 
 
 def admin_headers() -> dict[str, str]:
@@ -126,7 +129,7 @@ def test_admin_and_multiplexer_endpoints_are_guarded_and_functional(
         ]
         for path, payload in guarded_posts:
             response = client.post(path, json=payload)
-            assert response.status_code in {403, 503}, path
+            assert response.status_code in {403, 404, 503}, path
 
         connect = client.post(
             "/bots/connect",
@@ -181,14 +184,12 @@ def test_admin_and_multiplexer_endpoints_are_guarded_and_functional(
         shutdown = client.post(
             "/admin/runtime/shutdown", json={}, headers=admin_headers()
         )
-        assert shutdown.status_code == 403
-        assert "disabled" in shutdown.json()["detail"].lower()
+        assert shutdown.status_code == 404
 
         shed_memory = client.post(
             "/admin/runtime/shed-memory", json={}, headers=admin_headers()
         )
-        assert shed_memory.status_code == 403
-        assert "disabled" in shed_memory.json()["detail"].lower()
+        assert shed_memory.status_code == 404
 
 
 def test_public_webhook_security_and_channel_access_paths(

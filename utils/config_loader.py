@@ -141,6 +141,16 @@ def _load_config_sync(path: Path) -> dict[str, Any]:
         ),
         "admin_api_token": raw.get("admin_api_token")
         or settings.get("admin_api_token"),
+        "session_token_ttl_seconds": int(
+            raw.get("session_token_ttl_seconds")
+            if raw.get("session_token_ttl_seconds") is not None
+            else settings.get("session_token_ttl_seconds", 300)
+        ),
+        "allow_remote_bind": bool(
+            raw.get("allow_remote_bind")
+            if raw.get("allow_remote_bind") is not None
+            else settings.get("allow_remote_bind", False)
+        ),
         "autonomous_enabled": bool(
             raw.get("autonomous_enabled")
             if raw.get("autonomous_enabled") is not None

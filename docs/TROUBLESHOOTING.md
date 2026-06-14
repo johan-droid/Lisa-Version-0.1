@@ -35,6 +35,14 @@ tail -n 100 logs/lisa.log
 * **Cause**: Incorrect API tokens, webhook configuration, or network blockage.
 * **Solution**: Check that the token in `.env.local` is correct. Use curl to verify outbound connectivity to `api.telegram.org` or `slack.com`.
 
+### 4. "Session token is required" or dashboard keeps reconnecting
+* **Cause**: The dashboard shell loaded, but the protected websocket or `/personal` feed has no valid short-lived session cookie.
+* **Solution**: Open `/dashboard/live` and mint a fresh session with `LISA_ADMIN_API_TOKEN` or `LISA_BOT_SECURITY_KEY`. If the session expires, re-authenticate and reconnect.
+
+### 5. "Another main instance is already running" or repeated Telegram conflicts
+* **Cause**: A second `main.py`, `supervisor.py`, or `scratch/telegram_bridge.py` instance tried to start while a lock was already held.
+* **Solution**: Check `data/locks/` and the owning PID in the lock file. Stop the stale process cleanly before restarting. The bridge now exits instead of creating a webhook/delete retry storm.
+
 ---
 
 ## 🔄 Emergency Reset Procedures
