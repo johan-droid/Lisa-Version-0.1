@@ -317,7 +317,32 @@ def _print_banner(settings: Settings, bootstrap: BootstrapConfig) -> None:
 
 
 def main() -> None:
+    os.makedirs("data", exist_ok=True)
+    pid_file = "data/lisa.pid"
+
+    # Try to write PID atomically
+    import fcntl
+    import sys
+
+    try:
+        pid_fd = open(pid_file, "w")
+        fcntl.flock(pid_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        pid_fd.write(str(os.getpid()))
+        pid_fd.flush()
+    except (IOError, BlockingIOError):
+        try:
+            with open(pid_file, "r") as f:
+                holding_pid = f.read().strip()
+        except IOError:
+            holding_pid = "unknown"
+        print(
+            f"Cannot start LISA main: already running (PID: {holding_pid}). Exiting.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     args = parse_args()
+
     apply_memory_limit()
     config_path = Path(args.config).resolve()
     settings, bootstrap = load_bootstrap_config(config_path)

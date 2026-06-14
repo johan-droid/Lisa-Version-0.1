@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
-import pickle
+import hmac
+import hashlib
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -40,6 +42,8 @@ class PersonaSklearnGatingBundle:
     trained_at: str | None = None
 
     def save(self, path: Path) -> None:
+        import pickle
+
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("wb") as handle:
@@ -47,6 +51,8 @@ class PersonaSklearnGatingBundle:
 
     @classmethod
     def load(cls, path: Path) -> "PersonaSklearnGatingBundle":
+        import pickle
+
         path = Path(path)
         with path.open("rb") as handle:
             state = pickle.load(handle)
@@ -269,29 +275,165 @@ class PersonaGatingNetwork:
             learning_rate=learning_rate,
         )
 
+    def save(self, path: Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = self.to_state()
+
+        # Serialize arrays to npz
+        npz_path = path.with_suffix(".npz")
+        arrays = {
+            "W1": state["W1"],
+            "b1": state["b1"],
+            "W2": state["W2"],
+            "b2": state["b2"],
+        }
+        np.savez(npz_path, **arrays)
+
+        # Serialize metadata to json
+        # Make sure numpy arrays in encoder state are converted to lists
+        encoder_state = state["encoder"]
+
+        def _convert_ndarrays(d):
+            import numpy as np
+
+            for k, v in d.items():
+                if isinstance(v, np.ndarray):
+                    d[k] = v.tolist()
+                elif isinstance(v, dict):
+                    _convert_ndarrays(v)
+            return d
+
+        encoder_state = _convert_ndarrays(encoder_state)
+
+        metadata = {
+            "encoder": encoder_state,
+            "hidden_size": state["hidden_size"],
+            "personas": state["personas"],
+            "trained_at": state["trained_at"],
+        }
+        import json
+
+        json_data = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+
+        # Generate HMAC signature using existing snapshot signing key mechanism or a fallback
+        master_key = os.environ.get("LISA_MASTER_KEY") or os.environ.get(
+            "LISA_KEYS_MASTER_KEY", "default-insecure-key-do-not-use-in-prod"
+        )
+        sig = hmac.new(
+            master_key.encode("utf-8"), json_data, hashlib.sha256
+        ).hexdigest()
+
+        signed_metadata = {"metadata": metadata, "signature": sig}
+        json_path = path.with_suffix(".json")
+        json_path.write_text(
+            json.dumps(signed_metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
     @classmethod
     def load(cls, path: Path) -> "PersonaGatingNetwork":
         path = Path(path)
-        with path.open("rb") as handle:
-            state = pickle.load(handle)
-        if isinstance(state, PersonaSklearnGatingBundle):
-            return state
-        if isinstance(state, dict) and "vectorizer" in state and "classifier" in state:
-            return PersonaSklearnGatingBundle.from_state(state)
+        import json
+        import os
+        import hmac
+        import hashlib
+
+        # Migration from legacy pickle
+        if path.exists() and path.suffix == ".pkl":
+            import pickle
+
+            with path.open("rb") as handle:
+                state = pickle.load(handle)
+            # Create network from pickle state
+            if isinstance(state, PersonaSklearnGatingBundle):
+                # Cannot migrate bundle directly easily, reinitialize
+                network = cls.initialize()
+            elif (
+                isinstance(state, dict)
+                and "vectorizer" in state
+                and "classifier" in state
+            ):
+                network = cls.initialize()
+            elif isinstance(state, dict) and "W1" in state:
+                network = cls.from_state(state)
+            else:
+                # If it's a bundle, not supported anymore in raw format, return init
+                network = cls.initialize()
+
+            # Migrate to new format
+            new_path = path.with_suffix(".npz")
+            network.save(new_path)
+            # Delete old pickle
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return network
+
+        npz_path = path.with_suffix(".npz")
+        json_path = path.with_suffix(".json")
+
+        if not npz_path.exists() or not json_path.exists():
+            raise FileNotFoundError(
+                f"Gating model files not found: {npz_path}, {json_path}"
+            )
+
+        json_content = json_path.read_text(encoding="utf-8")
+        payload = json.loads(json_content)
+
+        metadata = payload.get("metadata", {})
+        signature = payload.get("signature", "")
+
+        master_key = os.environ.get("LISA_MASTER_KEY") or os.environ.get(
+            "LISA_KEYS_MASTER_KEY", "default-insecure-key-do-not-use-in-prod"
+        )
+        expected_sig = hmac.new(
+            master_key.encode("utf-8"),
+            json.dumps(metadata, ensure_ascii=False).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(signature, expected_sig):
+            raise PermissionError(
+                "Gating model signature verification failed. The file may have been tampered with."
+            )
+
+        arrays = np.load(npz_path, allow_pickle=False)
+
+        state = {
+            "encoder": metadata["encoder"],
+            "hidden_size": metadata["hidden_size"],
+            "personas": metadata["personas"],
+            "trained_at": metadata["trained_at"],
+            "W1": arrays["W1"],
+            "b1": arrays["b1"],
+            "W2": arrays["W2"],
+            "b2": arrays["b2"],
+        }
+        # reconstruct the ndarray for encoder idf_ if it's a list
+        if "idf_" in state["encoder"] and isinstance(state["encoder"]["idf_"], list):
+            state["encoder"]["idf_"] = np.array(
+                state["encoder"]["idf_"], dtype=np.float32
+            )
+
         return cls.from_state(state)
 
     @classmethod
     def load_or_initialize(cls, path: Path) -> "PersonaGatingNetwork":
-        if path.exists():
-            return cls.load(path)
-        network = cls.initialize()
-        network.save(path)
-        return network
+        path = Path(path)
+        npz_path = path.with_suffix(".npz")
+        if npz_path.exists() or path.exists():
+            try:
+                return cls.load(path)
+            except Exception as e:
+                import logging
 
-    def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("wb") as handle:
-            pickle.dump(self.to_state(), handle, protocol=pickle.HIGHEST_PROTOCOL)
+                logging.getLogger("lisa.gating").warning(
+                    f"Failed to load gating model: {e}. Reinitializing."
+                )
+        network = cls.initialize()
+        network.save(path.with_suffix(".npz"))
+        return network
 
     def to_state(self) -> dict[str, Any]:
         return {

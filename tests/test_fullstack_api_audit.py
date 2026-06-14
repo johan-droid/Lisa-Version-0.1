@@ -268,3 +268,46 @@ def test_parallel_api_stress_keeps_control_plane_responsive(tmp_path: Path) -> N
     assert all(size > 0 for _, size in results)
     assert post_stress_health.status_code == 200
     assert after_rss - before_rss < 250 * 1024 * 1024
+
+
+def test_admin_auth_requires_unsafe_flag_for_unsafe_endpoints():
+    from safety.admin_auth import require_admin_request
+    from fastapi import Request, HTTPException
+    import pytest
+    from unittest.mock import Mock
+
+    class MockSettings:
+        admin_api_token = "test-token"
+        enable_unsafe_admin_endpoints = False
+
+    req = Mock(spec=Request)
+    req.headers = {"authorization": "Bearer test-token"}
+
+    # Should pass without unsafe_only
+    require_admin_request(req, MockSettings())
+
+    # Should raise 403 with unsafe_only and enable_unsafe_admin_endpoints=False
+    with pytest.raises(HTTPException) as excinfo:
+        require_admin_request(req, MockSettings(), unsafe_only=True)
+    assert excinfo.value.status_code == 403
+    assert "disabled" in excinfo.value.detail.lower()
+
+    # Should pass with unsafe_only and enable_unsafe_admin_endpoints=True
+    MockSettings.enable_unsafe_admin_endpoints = True
+    require_admin_request(req, MockSettings(), unsafe_only=True)
+
+    # Missing token
+    req.headers = {}
+    with pytest.raises(HTTPException) as excinfo:
+        require_admin_request(req, MockSettings())
+    assert excinfo.value.status_code == 403
+
+    # Invalid token
+    req.headers = {"authorization": "Bearer wrong-token"}
+    with pytest.raises(HTTPException) as excinfo:
+        require_admin_request(req, MockSettings())
+    assert excinfo.value.status_code == 403
+
+    # X-Admin-Token
+    req.headers = {"x-admin-token": "test-token"}
+    require_admin_request(req, MockSettings())

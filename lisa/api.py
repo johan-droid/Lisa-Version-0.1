@@ -7,6 +7,7 @@ import asyncio
 import json
 import uuid
 import time
+import traceback
 from typing import Any
 import httpx
 from time import perf_counter
@@ -68,6 +69,20 @@ LOGGER = logging.getLogger("lisa.api")
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     event_bus = EventBus()
+
+    app = FastAPI(
+        title=settings.app_name, version="1.0.0", docs_url=None, redoc_url=None
+    )
+
+    @app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception):
+        LOGGER.error(f"Unhandled exception on {request.url}: {exc}")
+        LOGGER.error(traceback.format_exc())
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal Server Error", "detail": str(exc)},
+        )
+
     memory = HybridMemoryCoordinator(
         agent_id=str(getattr(settings, "agent_id", "lisa") or "lisa"),
         namespace=str(settings.db_path.resolve()),
@@ -324,11 +339,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/shutdown", deprecated=True)
     async def shutdown(request: Request) -> dict[str, str]:
-        require_admin_request(request, settings)
-        if not settings.enable_unsafe_admin_endpoints:
-            raise HTTPException(
-                status_code=403, detail="Unsafe admin endpoints are disabled."
-            )
+        require_admin_request(request, settings, unsafe_only=True)
 
         import os
         import signal
@@ -342,11 +353,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/shed_memory", deprecated=True)
     async def shed_memory(request: Request) -> dict[str, str]:
-        require_admin_request(request, settings)
-        if not settings.enable_unsafe_admin_endpoints:
-            raise HTTPException(
-                status_code=403, detail="Unsafe admin endpoints are disabled."
-            )
+        require_admin_request(request, settings, unsafe_only=True)
 
         # 1. Clear browser cache
         try:

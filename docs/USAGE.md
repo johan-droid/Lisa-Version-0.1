@@ -6,10 +6,10 @@ This guide explains how to interact with LISA, deploy tasks, manage constitution
 
 ## ⚡ Pairing with LISA
 
-On the first start, LISA outputs a generated `LISA_BOT_SECURITY_KEY` to the CLI logs (unless defined in `.env.local`). 
+On the first start, LISA outputs a generated `LISA_ADMIN_API_TOKEN` to the CLI logs (unless defined in `.env.local`).
 1. Open your messaging client (e.g. Telegram, Slack, WhatsApp).
-2. Type and send the pairing key: `/pair <LISA_BOT_SECURITY_KEY>` or simply message the security key directly.
-3. LISA will bind to your user ID, saving it in `data/bound_users.json`. All other incoming messages from other users will be rejected.
+2. Type and send the pairing key: `/pair <LISA_ADMIN_API_TOKEN>` or simply message the security key directly.
+3. LISA will bind to your user ID, saving it in `data/channel_access.json`. All other incoming messages from other users will be rejected.
 
 ---
 

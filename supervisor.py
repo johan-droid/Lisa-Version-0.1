@@ -91,7 +91,30 @@ def start_lisa() -> subprocess.Popen:
 
 
 def monitor_lisa() -> None:
+    os.makedirs("data", exist_ok=True)
+    pid_file = "data/lisa.pid"
+
+    # Try to write PID atomically
+    import fcntl
+
+    try:
+        pid_fd = open(pid_file, "w")
+        fcntl.flock(pid_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        pid_fd.write(str(os.getpid()))
+        pid_fd.flush()
+    except (IOError, BlockingIOError):
+        try:
+            with open(pid_file, "r") as f:
+                holding_pid = f.read().strip()
+        except IOError:
+            holding_pid = "unknown"
+        logger.error(
+            f"Cannot start supervisor: LISA is already running (PID: {holding_pid}). Exiting."
+        )
+        sys.exit(1)
+
     os.makedirs("logs", exist_ok=True)
+
     restart_attempts = 0
 
     while restart_attempts < MAX_RESTART_ATTEMPTS:
