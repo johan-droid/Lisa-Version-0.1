@@ -66,8 +66,6 @@ from utils.observability import bind_runtime_context
 LOGGER = logging.getLogger("lisa.api")
 
 
-
-
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     event_bus = EventBus()
